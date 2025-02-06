@@ -303,7 +303,18 @@ ax[1].set_xlabel("Time", size=16);
 plt.savefig("EVM/generated_images/magnification_comparison.png")
 plt.clf()
 
+freqs = np.fft.rfftfreq(NUM_FRAMES) * fs
+rates = np.abs(np.fft.rfft(reds))/NUM_FRAMES
+plt.plot(freqs[1:], rates[1:]);
+plt.title("DFT of Red channel Intensities")
+plt.xlabel("Freuqency")
+plt.ylabel("Amplitude");
+plt.savefig("EVM/generated_images/red_channel_fourier.png")
+plt.clf()
+
 # ------ Save Magnified Video ------
+
+
 
 
 
