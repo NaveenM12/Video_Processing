@@ -8,7 +8,7 @@ import scipy.signal as signal
 from PIL import Image 
 
 #Path to image
-DATA_PATH = r"EVM/test_videos/"
+DATA_PATH = r"/Users/naveenmirapuri/VideoProcessing/test_videos/"
 VIDEO_NAME = "face.mp4"
 VIDEO_PATH = os.path.join(DATA_PATH, VIDEO_NAME)
 
