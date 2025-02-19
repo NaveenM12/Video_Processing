@@ -4,6 +4,7 @@ import numpy as np
 from typing import Dict, List, Tuple
 import scipy.signal
 
+
 class FaceDetector:
     def __init__(self, min_detection_confidence: float = 0.5):
         """Initialize MediaPipe Face Detection"""
@@ -12,7 +13,8 @@ class FaceDetector:
             static_image_mode=False,
             max_num_faces=4,
             min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=0.5
+            min_tracking_confidence=0.5,
+            refine_landmarks=True
         )
         
         # Define landmarks for finding region centers
@@ -23,8 +25,12 @@ class FaceDetector:
         self.LEFT_CHEEK_CENTER_LANDMARKS = [330, 347, 280, 425, 266]  # Left cheek center area
         self.RIGHT_CHEEK_CENTER_LANDMARKS = [101, 118, 50, 36, 205]  # Right cheek center area
         
-        # Fixed window size for all regions
-        self.WINDOW_SIZE = 40
+        # Define rectangle dimensions for each region (width, height)
+        self.REGION_DIMENSIONS = {
+            'forehead': (80, 60),     # Wide rectangle for forehead
+            'left_cheek': (54, 70),   # Taller rectangle for cheeks
+            'right_cheek': (54, 70)   # Taller rectangle for cheeks
+        }
 
     def get_region_center(self, landmarks: List[Tuple[float, float]], indices: List[int]) -> Tuple[int, int]:
         """Calculate the center point of a region based on landmark points"""
@@ -36,16 +42,21 @@ class FaceDetector:
         
         return center_x, center_y
 
-    def extract_square_region(self, frame: np.ndarray, center: Tuple[int, int]) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
-        """Extract a fixed-size square region around a center point"""
+    def extract_rectangle_region(self, frame: np.ndarray, 
+                               center: Tuple[int, int],
+                               dimensions: Tuple[int, int]) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        """Extract a rectangular region around a center point with specified dimensions"""
         height, width = frame.shape[:2]
-        half_size = self.WINDOW_SIZE // 2
+        rect_width, rect_height = dimensions
         
         # Calculate region bounds
-        x_min = max(0, center[0] - half_size)
-        x_max = min(width, center[0] + half_size)
-        y_min = max(0, center[1] - half_size)
-        y_max = min(height, center[1] + half_size)
+        half_width = rect_width // 2
+        half_height = rect_height // 2
+        
+        x_min = max(0, center[0] - half_width)
+        x_max = min(width, center[0] + half_width)
+        y_min = max(0, center[1] - half_height)
+        y_max = min(height, center[1] + half_height)
         
         # Extract region
         region = frame[y_min:y_max, x_min:x_max]
@@ -53,12 +64,14 @@ class FaceDetector:
         return region, (x_min, y_min, x_max, y_max)
 
     def detect_faces(self, frame: np.ndarray) -> List[Dict]:
-        """Detect faces and extract small fixed-size regions"""
+        """Detect faces and extract rectangular regions"""
         height, width = frame.shape[:2]
         results = []
         
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mp.solutions.face_mesh.FaceMesh.IMAGE_DIMENSIONS = (height, width) 
         
         # Detect faces
         face_results = self.face_mesh.process(rgb_frame)
@@ -76,35 +89,41 @@ class FaceDetector:
             forehead_center = self.get_region_center(landmarks, self.FOREHEAD_CENTER_LANDMARKS)
             # Move the forehead center up by 20 pixels to avoid eyebrows
             forehead_center = (forehead_center[0], forehead_center[1] - 20)
-            forehead_img, forehead_bounds = self.extract_square_region(frame, forehead_center)
+            forehead_img, forehead_bounds = self.extract_rectangle_region(
+                frame, forehead_center, self.REGION_DIMENSIONS['forehead']
+            )
             
             # Process cheek regions
             left_cheek_center = self.get_region_center(landmarks, self.LEFT_CHEEK_CENTER_LANDMARKS)
             right_cheek_center = self.get_region_center(landmarks, self.RIGHT_CHEEK_CENTER_LANDMARKS)
             
-            left_cheek_img, left_cheek_bounds = self.extract_square_region(frame, left_cheek_center)
-            right_cheek_img, right_cheek_bounds = self.extract_square_region(frame, right_cheek_center)
+            left_cheek_img, left_cheek_bounds = self.extract_rectangle_region(
+                frame, left_cheek_center, self.REGION_DIMENSIONS['left_cheek']
+            )
+            right_cheek_img, right_cheek_bounds = self.extract_rectangle_region(
+                frame, right_cheek_center, self.REGION_DIMENSIONS['right_cheek']
+            )
             
             # Store regions if they're valid
             if forehead_img.size > 0:
                 regions['forehead'] = {
                     'image': forehead_img,
                     'bounds': forehead_bounds,
-                    'original_size': (self.WINDOW_SIZE, self.WINDOW_SIZE)
+                    'original_size': self.REGION_DIMENSIONS['forehead']
                 }
             
             if left_cheek_img.size > 0:
                 regions['left_cheek'] = {
                     'image': left_cheek_img,
                     'bounds': left_cheek_bounds,
-                    'original_size': (self.WINDOW_SIZE, self.WINDOW_SIZE)
+                    'original_size': self.REGION_DIMENSIONS['left_cheek']
                 }
                 
             if right_cheek_img.size > 0:
                 regions['right_cheek'] = {
                     'image': right_cheek_img,
                     'bounds': right_cheek_bounds,
-                    'original_size': (self.WINDOW_SIZE, self.WINDOW_SIZE)
+                    'original_size': self.REGION_DIMENSIONS['right_cheek']
                 }
             
             if regions:
@@ -317,7 +336,8 @@ class FacialColorMagnification:
 
 if __name__ == "__main__":
     # Define input and output paths
-    input_video_path = "test_videos/face.mp4"  # Path to your input video
+    # input_video_path = "test_videos/face.mp4"  # Path to your input video
+    input_video_path = "test_videos/face.mp4"
     output_video_path = "Face_Color_Magnification/output_videos/output.mp4"  # Path where output will be saved
     
     # Create output directory if it doesn't exist

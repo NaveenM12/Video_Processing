@@ -8,8 +8,6 @@ import matplotlib as mpl
 from matplotlib import cm
 import torch.nn as nn
 
-
-
 from utils.steerable_pyramid import SteerablePyramid, SuboctaveSP
 from utils.phase_utils import *
 from utils.pyramid_utils import build_level, build_level_batch, recon_level_batch
