@@ -167,10 +167,10 @@ class FaceDetector:
 
 class PhaseMagnification:
     def __init__(self, 
-                 phase_mag: float = 25.0,
-                 f_lo: float = 0.2,
-                 f_hi: float = 0.25,
-                 sigma: float = 5.0,
+                 phase_mag: float = 20.0,
+                 f_lo: float = 0.25,
+                 f_hi: float = 0.3,
+                 sigma: float = 3.0,
                  attenuate: bool = True):
         """Initialize Phase-Based Motion Magnification parameters"""
         self.phase_mag = phase_mag
