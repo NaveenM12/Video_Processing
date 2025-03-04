@@ -136,8 +136,8 @@ class CombinedFacialMagnification:
 
 if __name__ == "__main__":
     # Define input and output paths
-    input_video_path = "test_videos/face.mp4"
-    output_video_path = "Combined_Magnification/output_videos/output.mp4"
+    input_video_path = "test_videos/duncan_1to10.mp4"
+    output_video_path = "Combined_Color_Motion_Magnification/output_videos/duncan_1to10_magnified.mp4"
     
     # Create output directory if it doesn't exist
     import os
