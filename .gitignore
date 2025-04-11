@@ -11,6 +11,11 @@
 *.data
 *.bin
 
+# Output directories that might contain large files
+**/output_videos/
+**/Videos_Misc/
+**/test_videos/
+
 # Misc
 .DS_Store
 __pycache__/
