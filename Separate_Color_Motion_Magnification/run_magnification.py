@@ -1,3 +1,4 @@
+#!/usr/local/bin/python3
 import argparse
 import os
 from side_by_side_magnification import SideBySideMagnification

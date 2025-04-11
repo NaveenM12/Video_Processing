@@ -1,0 +1,18 @@
+# Video files
+*.mp4
+*.MTS
+*.avi
+*.mov
+*.wmv
+*.flv
+*.mkv
+
+# Large data files
+*.data
+*.bin
+
+# Misc
+.DS_Store
+__pycache__/
+*.py[cod]
+*$py.class 
