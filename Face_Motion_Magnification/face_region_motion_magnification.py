@@ -4,9 +4,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import matplotlib.pyplot as plt
+from scipy import signal
 from typing import Dict, List, Tuple
 from Face_Motion_Magnification.utils.steerable_pyramid import SteerablePyramid
 from Face_Motion_Magnification.utils.phase_utils import rgb2yiq, yiq2rgb
+import os
 
 class FaceDetector:
     def __init__(self, min_detection_confidence: float = 0.5):
@@ -24,17 +27,15 @@ class FaceDetector:
         self.LEFT_EYE_LANDMARKS = [252, 254, 442, 443]  # Left eye area
         self.RIGHT_EYE_LANDMARKS = [223, 222, 24, 22]  # Right eye area
         self.NOSE_TIP_LANDMARKS = [195, 5, 4, 1, 19]  # Nose tip area
-        # Split mouth landmarks into left and right sides
-        self.LEFT_MOUTH_LANDMARKS = [61]  # Left mouth corner area
-        self.RIGHT_MOUTH_LANDMARKS = [291]  # Right mouth corner area
+        # Replace separate mouth landmarks with single mouth landmarks
+        self.MOUTH_LANDMARKS = [61, 291, 0, 17, 78, 308]  # Left and right corners + additional mouth points
         
         # Define rectangle dimensions for each region (width, height)
         self.REGION_DIMENSIONS = {
-            'left_eye': (116, 84),    # Wider than tall for eyes
-            'right_eye': (116, 84),   # Wider than tall for eyes
-            'nose_tip': (100, 80),  # Square for nose
-            'left_mouth': (70, 54),  # Square for mouth corners
-            'right_mouth': (70, 54)  # Square for mouth corners
+            'left_eye': (160, 140),    # Wider than tall for eyes
+            'right_eye': (160, 140),   # Wider than tall for eyes
+            'nose_tip': (130, 100),    # Square for nose
+            'mouth': (186, 80)        # Wide rectangle for full mouth
         }
 
     def get_region_center(self, landmarks: List[Tuple[float, float]], indices: List[int]) -> Tuple[int, int]:
@@ -93,12 +94,16 @@ class FaceDetector:
             
             # Process left eye region
             left_eye_center = self.get_region_center(landmarks, self.LEFT_EYE_LANDMARKS)
+            # Move the left eye center upward to include eyebrows
+            left_eye_center = (left_eye_center[0], left_eye_center[1] - 20)
             left_eye_img, left_eye_bounds = self.extract_rectangle_region(
                 frame, left_eye_center, self.REGION_DIMENSIONS['left_eye']
             )
             
             # Process right eye region
             right_eye_center = self.get_region_center(landmarks, self.RIGHT_EYE_LANDMARKS)
+            # Move the right eye center upward to include eyebrows
+            right_eye_center = (right_eye_center[0], right_eye_center[1] - 20)
             right_eye_img, right_eye_bounds = self.extract_rectangle_region(
                 frame, right_eye_center, self.REGION_DIMENSIONS['right_eye']
             )
@@ -109,16 +114,10 @@ class FaceDetector:
                 frame, nose_tip_center, self.REGION_DIMENSIONS['nose_tip']
             )
             
-            # Process left mouth region
-            left_mouth_center = self.get_region_center(landmarks, self.LEFT_MOUTH_LANDMARKS)
-            left_mouth_img, left_mouth_bounds = self.extract_rectangle_region(
-                frame, left_mouth_center, self.REGION_DIMENSIONS['left_mouth']
-            )
-            
-            # Process right mouth region
-            right_mouth_center = self.get_region_center(landmarks, self.RIGHT_MOUTH_LANDMARKS)
-            right_mouth_img, right_mouth_bounds = self.extract_rectangle_region(
-                frame, right_mouth_center, self.REGION_DIMENSIONS['right_mouth']
+            # Process unified mouth region (replacing separate left/right mouth regions)
+            mouth_center = self.get_region_center(landmarks, self.MOUTH_LANDMARKS)
+            mouth_img, mouth_bounds = self.extract_rectangle_region(
+                frame, mouth_center, self.REGION_DIMENSIONS['mouth']
             )
             
             # Store regions if they're valid
@@ -143,18 +142,11 @@ class FaceDetector:
                     'original_size': self.REGION_DIMENSIONS['nose_tip']
                 }
                 
-            if left_mouth_img.size > 0:
-                regions['left_mouth'] = {
-                    'image': left_mouth_img,
-                    'bounds': left_mouth_bounds,
-                    'original_size': self.REGION_DIMENSIONS['left_mouth']
-                }
-                
-            if right_mouth_img.size > 0:
-                regions['right_mouth'] = {
-                    'image': right_mouth_img,
-                    'bounds': right_mouth_bounds,
-                    'original_size': self.REGION_DIMENSIONS['right_mouth']
+            if mouth_img.size > 0:
+                regions['mouth'] = {
+                    'image': mouth_img,
+                    'bounds': mouth_bounds,
+                    'original_size': self.REGION_DIMENSIONS['mouth']
                 }
             
             if regions:
@@ -167,10 +159,10 @@ class FaceDetector:
 
 class PhaseMagnification:
     def __init__(self, 
-                 phase_mag: float = 20.0,
+                 phase_mag: float = 15.0,
                  f_lo: float = 0.25,
                  f_hi: float = 0.3,
-                 sigma: float = 3.0,
+                 sigma: float = 1.0,
                  attenuate: bool = True):
         """Initialize Phase-Based Motion Magnification parameters"""
         self.phase_mag = phase_mag
@@ -254,10 +246,16 @@ class PhaseMagnification:
         """Reconstruct pyramid level for a batch of filters"""
         return torch.fft.fftshift(torch.fft.fft2(pyr)) * filter_batch
 
-    def magnify(self, frames: List[np.ndarray]) -> List[np.ndarray]:
-        """Apply Phase-Based Motion Magnification to a sequence of frames"""
+    def magnify(self, frames: List[np.ndarray]) -> Tuple[List[np.ndarray], np.ndarray]:
+        """Apply Phase-Based Motion Magnification to a sequence of frames and track phase changes
+        
+        Returns:
+            Tuple containing:
+                - List of magnified frames
+                - Array of phase change magnitudes over time
+        """
         if not frames or len(frames) < 2:
-            return frames
+            return frames, np.zeros((len(frames),))
             
         # Convert frames to YIQ color space
         yiq_frames = []
@@ -283,6 +281,11 @@ class PhaseMagnification:
         # Store DFT of motion magnified frames
         recon_dft = torch.zeros((len(frames), h, w), dtype=torch.complex64).to(self.device)
         
+        # Track phase change magnitudes for each frame with better approach
+        # Now we'll store maximum phase changes and use weighted sum based on amplitude
+        phase_changes = np.zeros(len(frames))
+        total_weight = 0.0
+        
         # Reference frame (first frame)
         ref_idx = 0
         
@@ -306,6 +309,9 @@ class PhaseMagnification:
             phase_deltas = torch.zeros((idx2-idx1, len(frames), h, w),
                                      dtype=torch.complex64).to(self.device)
             
+            # Track amplitude for weighting
+            avg_amplitude = torch.zeros((idx2-idx1), dtype=torch.float32).to(self.device)
+            
             for vid_idx in range(len(frames)):
                 curr_pyr = self.build_level_batch(video_dft[vid_idx], filter_batch)
                 
@@ -314,6 +320,11 @@ class PhaseMagnification:
                 
                 # Wrap phase delta to [-pi, pi]
                 phase_deltas[:, vid_idx] = ((torch.pi + _delta) % (2*torch.pi)) - torch.pi
+                
+                # Store average amplitude for this level
+                if vid_idx == 0:
+                    # Use amplitude from first frame as reference weighting
+                    avg_amplitude = torch.mean(torch.abs(curr_pyr), dim=(1, 2))
             
             # Create and apply temporal filter matching the number of frames
             bandpass = self.create_temporal_filter(len(frames))
@@ -352,6 +363,22 @@ class PhaseMagnification:
                     ).squeeze(1)
                     
                     delta /= weight
+                
+                # Track phase change magnitude using a better approach
+                # Use 95th percentile to catch significant motion but avoid outliers
+                # Also weight by amplitude to focus on more important signals
+                for i in range(len(avg_amplitude)):
+                    # Get 95th percentile of motion in this level/orientation
+                    level_delta = torch.abs(delta[i])
+                    percentile_value = torch.quantile(level_delta.flatten(), 0.95)
+                    
+                    # Weight this level's contribution by its amplitude
+                    weight = avg_amplitude[i].item()
+                    phase_changes[vid_idx] += percentile_value.item() * weight
+                    
+                    # Add to total weight only on first frame
+                    if vid_idx == 0:
+                        total_weight += weight
                 
                 # Modify phase variation
                 modified_phase = delta * self.phase_mag
@@ -396,15 +423,166 @@ class PhaseMagnification:
             # Convert back to BGR
             magnified_frames.append(cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR))
         
-        return magnified_frames
+        # Normalize by total amplitude weight for consistent scaling
+        if total_weight > 0:
+            phase_changes = phase_changes / total_weight
+            
+        # Normalize phase change magnitudes for better visualization
+        if np.max(phase_changes) > 0:
+            phase_changes = phase_changes / np.max(phase_changes)
+        
+        return magnified_frames, phase_changes
 
 class FacialPhaseMagnification:
     def __init__(self):
         self.face_detector = FaceDetector()
         self.phase_magnifier = PhaseMagnification()
         
-    def process_video(self, input_path: str, output_path: str):
-        """Process video with facial phase-based motion magnification"""
+    def plot_phase_changes(self, region_phase_changes, output_dir):
+        """Plot phase changes for each facial region with improved visualization
+        
+        Args:
+            region_phase_changes: Dictionary with region names as keys and phase change arrays as values
+            output_dir: Directory to save the plots
+        """
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create a single figure with subplots for each region
+        fig, axes = plt.subplots(len(region_phase_changes), 1, figsize=(12, 10), sharex=True)
+        
+        # If there's only one region, make axes iterable
+        if len(region_phase_changes) == 1:
+            axes = [axes]
+            
+        for idx, (region_name, phase_changes) in enumerate(region_phase_changes.items()):
+            # Skip if no data
+            if len(phase_changes) == 0:
+                continue
+                
+            # Time points (x-axis)
+            time_points = np.arange(len(phase_changes))
+            
+            # Plot
+            axes[idx].plot(time_points, phase_changes, '-', linewidth=2)
+            axes[idx].set_title(f'{region_name.replace("_", " ").title()} Phase Changes')
+            axes[idx].set_ylabel('Magnitude')
+            
+            # Add grid
+            axes[idx].grid(True, linestyle='--', alpha=0.7)
+            
+            # Highlight peaks
+            peaks, _ = signal.find_peaks(phase_changes, height=0.5)  # Adjust height as needed
+            if len(peaks) > 0:
+                axes[idx].plot(peaks, phase_changes[peaks], 'ro')
+        
+        # Set common labels
+        plt.xlabel('Frame Number')
+        plt.tight_layout()
+        
+        # Save the figure
+        plt.savefig(os.path.join(output_dir, 'phase_changes.png'), dpi=150)
+        plt.close()
+        
+        # Create more detailed individual plots for each region
+        for region_name, phase_changes in region_phase_changes.items():
+            # Skip if no data or too few frames
+            if len(phase_changes) < 3:
+                continue
+            
+            # Create a figure with multiple subplots for detailed analysis
+            fig, axes = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
+            
+            # Time points (x-axis)
+            time_points = np.arange(len(phase_changes))
+            
+            # 1. Raw phase changes plot
+            axes[0].plot(time_points, phase_changes, '-', linewidth=2, color='blue')
+            axes[0].set_title(f'{region_name.replace("_", " ").title()} Raw Phase Changes')
+            axes[0].set_ylabel('Magnitude')
+            axes[0].grid(True, linestyle='--', alpha=0.7)
+            
+            # Highlight peaks in raw data
+            peaks, _ = signal.find_peaks(phase_changes, height=0.5)  # Adjust height as needed
+            if len(peaks) > 0:
+                axes[0].plot(peaks, phase_changes[peaks], 'ro', label='Peaks')
+                axes[0].legend()
+            
+            # 2. Frame-to-frame derivative (better shows motion spikes)
+            derivatives = np.abs(np.diff(phase_changes))
+            # Add zero at the beginning to maintain same length
+            derivatives = np.insert(derivatives, 0, 0)
+            
+            axes[1].plot(time_points, derivatives, '-', linewidth=2, color='green')
+            axes[1].set_title(f'{region_name.replace("_", " ").title()} Frame-to-Frame Change Rate')
+            axes[1].set_ylabel('Rate of Change')
+            axes[1].grid(True, linestyle='--', alpha=0.7)
+            
+            # Highlight spikes in derivative
+            derivative_peaks, _ = signal.find_peaks(derivatives, height=np.max(derivatives) * 0.4)
+            if len(derivative_peaks) > 0:
+                axes[1].plot(derivative_peaks, derivatives[derivative_peaks], 'ro', label='Motion Spikes')
+                axes[1].legend()
+            
+            # 3. Frequency domain analysis (shows periodic motion)
+            if len(phase_changes) > 10:  # Need enough data for FFT
+                # Compute FFT
+                phase_fft = np.abs(np.fft.rfft(phase_changes - np.mean(phase_changes)))
+                freqs = np.fft.rfftfreq(len(phase_changes))
+                
+                # Exclude DC component (first value)
+                axes[2].plot(freqs[1:], phase_fft[1:], '-', linewidth=2, color='purple')
+                axes[2].set_title(f'{region_name.replace("_", " ").title()} Frequency Components')
+                axes[2].set_xlabel('Frequency (cycles/frame)')
+                axes[2].set_ylabel('Amplitude')
+                axes[2].grid(True, linestyle='--', alpha=0.7)
+                
+                # Find dominant frequencies
+                if len(phase_fft) > 3:
+                    freq_peaks, _ = signal.find_peaks(phase_fft[1:], height=np.max(phase_fft[1:]) * 0.3)
+                    if len(freq_peaks) > 0:
+                        axes[2].plot(freqs[1:][freq_peaks], phase_fft[1:][freq_peaks], 'ro', 
+                                  label='Dominant Frequencies')
+                        axes[2].legend()
+            else:
+                axes[2].text(0.5, 0.5, 'Not enough frames for frequency analysis', 
+                          horizontalalignment='center', verticalalignment='center',
+                          transform=axes[2].transAxes)
+                axes[2].set_title(f'{region_name.replace("_", " ").title()} Frequency Components')
+                axes[2].set_xlabel('Frequency (cycles/frame)')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{region_name}_detailed_analysis.png'), dpi=150)
+            plt.close()
+            
+            # Also create a cleaner single plot just showing raw phase changes (original implementation)
+            plt.figure(figsize=(10, 6))
+            plt.plot(time_points, phase_changes, '-', linewidth=2)
+            plt.title(f'{region_name.replace("_", " ").title()} Phase Changes')
+            plt.xlabel('Frame Number')
+            plt.ylabel('Magnitude')
+            plt.grid(True, linestyle='--', alpha=0.7)
+            
+            # Highlight peaks
+            if len(peaks) > 0:
+                plt.plot(peaks, phase_changes[peaks], 'ro', label='Peaks')
+                plt.legend()
+            
+            plt.savefig(os.path.join(output_dir, f'{region_name}_phase_changes.png'), dpi=150)
+            plt.close()
+        
+    def process_video(self, input_path: str, output_path: str, plot_dir: str = None):
+        """Process video with facial phase-based motion magnification and generate phase change plots
+        
+        Args:
+            input_path: Path to input video
+            output_path: Path to output video
+            plot_dir: Directory to save phase change plots. If None, will use the directory of output_path.
+        """
+        # Set default plot directory
+        if plot_dir is None:
+            plot_dir = os.path.join(os.path.dirname(output_path), 'phase_plots')
+        
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             print(f"Error: Could not open video file {input_path}")
@@ -441,10 +619,13 @@ class FacialPhaseMagnification:
         print("Processing facial regions...")
         processed_frames = all_frames.copy()
         
+        # Dictionary to store phase changes for each region
+        all_phase_changes = {}
+        
         # Process each face
         for face_idx in range(len(all_faces[0])):  # For each face detected in first frame
             # Process each region
-            for region_name in ['left_eye', 'right_eye', 'nose_tip', 'left_mouth', 'right_mouth']:
+            for region_name in ['left_eye', 'right_eye', 'nose_tip', 'mouth']:
                 print(f"Processing {region_name} for face {face_idx + 1}...")
                 
                 # Collect region frames
@@ -457,7 +638,11 @@ class FacialPhaseMagnification:
                 
                 if region_frames:
                     # Magnify the region
-                    magnified_frames = self.phase_magnifier.magnify(region_frames)
+                    magnified_frames, phase_changes = self.phase_magnifier.magnify(region_frames)
+                    
+                    # Store phase changes for this region
+                    region_key = f"face{face_idx+1}_{region_name}"
+                    all_phase_changes[region_key] = phase_changes
                     
                     # Replace the regions in the processed frames
                     for frame_idx, magnified in enumerate(magnified_frames):
@@ -479,6 +664,11 @@ class FacialPhaseMagnification:
                             processed_frames[frame_idx][bounds[1]:bounds[3], 
                                                       bounds[0]:bounds[2]] = magnified
         
+        # Generate phase change plots
+        if all_phase_changes:
+            print("Generating phase change plots...")
+            self.plot_phase_changes(all_phase_changes, plot_dir)
+        
         # Write processed frames
         print("Writing output video...")
         for frame in processed_frames:
@@ -492,6 +682,7 @@ if __name__ == "__main__":
     # Define input and output paths
     input_video_path = "test_videos/face.mp4"
     output_video_path = "Face_Motion_Magnification/output_videos/output.mp4"
+    plot_dir = "Face_Motion_Magnification/output_videos/phase_plots"
     
     # Create output directory if it doesn't exist
     import os
@@ -499,7 +690,7 @@ if __name__ == "__main__":
     
     # Process the video
     processor = FacialPhaseMagnification()
-    processor.process_video(input_video_path, output_video_path)
+    processor.process_video(input_video_path, output_video_path, plot_dir)
 
 
 

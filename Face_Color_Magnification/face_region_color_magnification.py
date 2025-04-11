@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 from typing import Dict, List, Tuple
 import scipy.signal
+import traceback
 
 
 class FaceDetector:
@@ -27,9 +28,9 @@ class FaceDetector:
         
         # Define rectangle dimensions for each region (width, height)
         self.REGION_DIMENSIONS = {
-            'forehead': (80, 60),     # Wide rectangle for forehead
-            'left_cheek': (54, 70),   # Taller rectangle for cheeks
-            'right_cheek': (54, 70)   # Taller rectangle for cheeks
+            'forehead': (90, 70),     # Wide rectangle for forehead
+            'left_cheek': (80, 84),   # Taller rectangle for cheeks
+            'right_cheek': (80, 84)   # Taller rectangle for cheeks
         }
 
     def get_region_center(self, landmarks: List[Tuple[float, float]], indices: List[int]) -> Tuple[int, int]:
@@ -185,65 +186,111 @@ class ColorMagnification:
         return pyramid
 
     def temporal_bandpass_filter(self, frames: np.ndarray) -> np.ndarray:
-        """Apply temporal bandpass filter"""
+        """Apply temporal bandpass filter following the article's approach"""
         fs = 30  # Sampling rate (30fps)
-        b, a = scipy.signal.butter(1, [self.f_lo/(fs/2), self.f_hi/(fs/2)], btype='band')
         
-        # Apply filter along temporal dimension
-        filtered = scipy.signal.filtfilt(b, a, frames, axis=0)
-        return filtered
+        # Implement FIR filter similar to the article rather than IIR (Butterworth)
+        # This provides better frequency isolation for heart rate detection
+        num_frames = frames.shape[0]
+        bandpass = scipy.signal.firwin(
+            numtaps=num_frames,
+            cutoff=(self.f_lo, self.f_hi),
+            fs=fs,
+            pass_zero=False
+        )
+        
+        # Get transfer function
+        transfer_function = np.fft.rfft(bandpass)
+        
+        # Apply filter in frequency domain for each pixel
+        filtered_frames = np.zeros_like(frames)
+        
+        # For each pixel position
+        for y in range(frames.shape[1]):
+            for x in range(frames.shape[2]):
+                # Get temporal signal for this pixel
+                pixel_values = frames[:, y, x]
+                
+                # Apply filter in frequency domain
+                pixel_fft = np.fft.rfft(pixel_values)
+                filtered_fft = pixel_fft * transfer_function
+                filtered_signal = np.fft.irfft(filtered_fft, num_frames)
+                
+                # Store filtered result
+                filtered_frames[:, y, x] = filtered_signal
+        
+        return filtered_frames
 
     def magnify(self, frames: List[np.ndarray]) -> List[np.ndarray]:
-        """Apply Eulerian Video Magnification with corrected color handling"""
+        """Apply Eulerian Video Magnification optimized for heart rate detection"""
         if not frames or len(frames) < 2:
             return frames
 
-        # Convert all frames to YIQ color space
-        yiq_frames = np.array([self.bgr2yiq(frame) for frame in frames])
+        # Verify all frames have the same shape
+        first_shape = frames[0].shape
+        for i, frame in enumerate(frames):
+            if frame.shape != first_shape:
+                print(f"WARNING: Frame {i} has shape {frame.shape} which differs from the first frame shape {first_shape}")
+                # Resize to match the first frame
+                frames[i] = cv2.resize(frame, (first_shape[1], first_shape[0]))
         
-        # Calculate pyramid dimensions once
-        height, width = frames[0].shape[:2]
-        pyr_height = height
-        pyr_width = width
-        for _ in range(self.level):
-            pyr_height = (pyr_height + 1) // 2
-            pyr_width = (pyr_width + 1) // 2
-        
-        # Split channels and build pyramids
-        magnified_frames = []
-        magnified_yiq = np.zeros_like(yiq_frames)
-        
-        for channel in range(3):  # For each YIQ channel
-            # Extract channel frames
-            channel_frames = yiq_frames[:, :, :, channel]
+        try:
+            # Convert all frames to YIQ color space
+            yiq_frames = np.array([self.bgr2yiq(frame) for frame in frames])
             
-            # Build pyramid for each frame
-            pyramid_frames = np.zeros((len(frames), pyr_height, pyr_width))
+            # Get dimensions for the pyramid
+            height, width = frames[0].shape[:2]
+            pyr_height = height
+            pyr_width = width
+            for _ in range(self.level):
+                pyr_height = (pyr_height + 1) // 2
+                pyr_width = (pyr_width + 1) // 2
             
-            for i, frame in enumerate(channel_frames):
-                # Ensure frame is 2D
-                frame_2d = frame.reshape(height, width)
-                pyramid = self.build_gaussian_pyramid(frame_2d)
-                # Ensure consistent size
-                pyramid_frames[i] = cv2.resize(pyramid[-1], (pyr_width, pyr_height))
+            # Process each channel separately - focus on Y channel for heart rate
+            magnified_frames = []
+            magnified_yiq = np.zeros_like(yiq_frames)
             
-            # Apply temporal filter to pyramid level
-            filtered = self.temporal_bandpass_filter(pyramid_frames)
-            
-            # Amplify and reconstruct
-            for i in range(len(frames)):
-                # Amplify
-                magnified = filtered[i] * self.alpha
+            for channel in range(3):  # For each YIQ channel
+                # Extract channel frames
+                channel_frames = yiq_frames[:, :, :, channel]
                 
-                # Add back to original
-                magnified_yiq[i, :, :, channel] = yiq_frames[i, :, :, channel] + \
-                    cv2.resize(magnified, (width, height))
-        
-        # Convert back to BGR
-        for i in range(len(frames)):
-            magnified_frames.append(self.yiq2rgb(magnified_yiq[i]))
-        
-        return magnified_frames
+                # Build pyramid for each frame
+                pyramid_frames = np.zeros((len(frames), pyr_height, pyr_width))
+                
+                for i, frame in enumerate(channel_frames):
+                    # Create 2D frame
+                    frame_2d = frame.reshape(height, width)
+                    pyramid = self.build_gaussian_pyramid(frame_2d)
+                    # Get the last level (most downsampled)
+                    pyramid_frames[i] = cv2.resize(pyramid[-1], (pyr_width, pyr_height))
+                
+                # Apply temporal filter to pyramid level
+                filtered = self.temporal_bandpass_filter(pyramid_frames)
+                
+                # Apply magnification - use lower alpha factor for I and Q channels
+                # to prevent color artifacts (as per the article's approach)
+                channel_alpha = self.alpha if channel == 0 else self.alpha * 0.5
+                
+                # Amplify and reconstruct
+                for i in range(len(frames)):
+                    # Amplify using appropriate factor for each channel
+                    magnified = filtered[i] * channel_alpha
+                    
+                    # Add back to original
+                    magnified_yiq[i, :, :, channel] = yiq_frames[i, :, :, channel] + \
+                        cv2.resize(magnified, (width, height))
+            
+            # Convert back to BGR
+            for i in range(len(frames)):
+                magnified_frames.append(self.yiq2rgb(magnified_yiq[i]))
+            
+            return magnified_frames
+            
+        except Exception as e:
+            print(f"Error in color magnification: {str(e)}")
+            print("Returning original frames without magnification")
+            traceback.print_exc()
+            return frames.copy()
     
 
 class FacialColorMagnification:
