@@ -205,7 +205,7 @@ class SideBySideMagnification:
         
         return region, (x_min, y_min, x_max, y_max)
     
-    def create_single_plot(self, phase_data, frame_idx, plot_width, plot_height, plot_type="raw", title=None):
+    def create_single_plot(self, phase_data, frame_idx, plot_width, plot_height, plot_type="raw", title=None, total_frames=None):
         """Creates a single square plot of either raw phase data or frame-to-frame changes
         
         Args:
@@ -215,6 +215,7 @@ class SideBySideMagnification:
             plot_height: Height of the plot in pixels
             plot_type: "raw" or "diff" for raw phase changes or frame-to-frame differences
             title: Title to display on the plot
+            total_frames: Total number of frames in the video
             
         Returns:
             Square plot image as numpy array
@@ -236,9 +237,19 @@ class SideBySideMagnification:
             # Get array length
             max_len = len(phase_data)
             
-            # Don't try to process if frame_idx is beyond available data
-            if frame_idx >= max_len:
-                frame_idx = max_len - 1
+            # If total_frames is not provided, use phase data length
+            if total_frames is None or total_frames <= 0:
+                total_frames = max_len
+            
+            # Scale frame_idx to match the phase data length
+            # This ensures the green dot moves correctly across the entire graph
+            # even if the videos have different lengths
+            if max_len > 1:
+                # Use linear mapping: Current position / Total frames = Scaled position / Total phase data
+                # This ensures the green dot moves in sync with the video playback
+                scaled_frame_idx = min(int((frame_idx / (total_frames - 1)) * (max_len - 1)), max_len - 1) if total_frames > 1 else 0
+            else:
+                scaled_frame_idx = 0
             
             # Get full timeline data
             x = np.arange(len(phase_data))
@@ -274,8 +285,8 @@ class SideBySideMagnification:
                 ax.plot(peaks, y[peaks], 'ro', markersize=6)
             
             # Add a bright green dot for current frame position - make it larger and more visible
-            if frame_idx > 0 and frame_idx < len(y):
-                ax.plot(frame_idx, y[frame_idx], 'o', color='lime', markersize=12, 
+            if scaled_frame_idx > 0 and scaled_frame_idx < len(y):
+                ax.plot(scaled_frame_idx, y[scaled_frame_idx], 'o', color='lime', markersize=12, 
                        markeredgecolor='black', markeredgewidth=2, zorder=10)
             
             # Set title
@@ -296,9 +307,9 @@ class SideBySideMagnification:
             if ax.get_ylim()[1] > 0:
                 ax.set_ylim(0, ax.get_ylim()[1] * 1.1)
             
-            # Add a frame counter
-            frame_text = f"Frame: {frame_idx}/{max_len-1}"
-            fig.text(0.02, 0.02, frame_text, fontsize=10, 
+            # Add a frame counter with both actual and scaled position
+            frame_text = f"Video Frame: {frame_idx+1}/{total_frames} | Graph Position: {scaled_frame_idx+1}/{max_len}"
+            fig.text(0.02, 0.02, frame_text, fontsize=8, 
                    bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
             
             # Adjust layout 
@@ -1274,18 +1285,19 @@ class SideBySideMagnification:
         # Heart rate plots
         pulse_plots_needed = 2 if bpm_data else 0  # Heart rate and pulse signal
         
-        # Calculate total plots and organize them in rows
-        plots_per_row = 3  # Number of plot pairs per row (one for each video column)
-        num_motion_plots = len(motion_regions_to_plot)
+        # New layout:
+        # - First column: All frame-to-frame graphs (nose, left eye, right eye)
+        # - Second column: All raw graphs (nose, left eye, right eye)
+        # - Third column: Heart rate estimation and pulse signal
         
-        # Calculate how many rows we need
-        # One row for motion plots and one row for pulse if needed
-        total_plot_rows = 1  # At least one row for motion plots
+        # We now have 3 rows (nose, left eye, right eye) and 3 columns
+        plots_per_row = 3  # Number of columns
+        num_motion_regions = len(motion_regions_to_plot)
         
-        # Add a row for pulse/heart rate if needed
-        if pulse_plots_needed > 0:
-            total_plot_rows += 1
+        # Calculate how many rows we need - each row will contain one region's "raw" and "diff" plots
+        total_plot_rows = num_motion_regions  # One row for each motion region
         
+        # Calculate total height needed for all plots
         total_plot_height = total_plot_rows * plot_size
         
         # Calculate combined frame dimensions: videos on top, plots below
@@ -1327,70 +1339,104 @@ class SideBySideMagnification:
             except Exception as e:
                 print(f"Error placing videos in frame {i}: {str(e)}")
             
-            # Add motion region plots below videos - one per video column
-            for idx, region_name in enumerate(motion_regions_to_plot):
-                if idx >= plots_per_row:  # Only show up to 3 regions
-                    break
-                    
-                # Calculate position for this plot - place directly under corresponding video
-                # Left eye under original, right eye under motion, nose under color
-                plot_col = 0  # Default to first column
-                if 'left_eye' in region_name:
-                    plot_col = 0  # Left video column
-                elif 'right_eye' in region_name:
-                    plot_col = 1  # Middle video column
-                elif 'nose_tip' in region_name or 'nose' in region_name:
-                    plot_col = 2  # Right video column
-                    
-                y_start = video_height
-                y_end = y_start + plot_size
-                x_start = plot_col * width
-                x_end = x_start + width
-                
-                # Generate plot for this region
-                try:
-                    region_plot = self.create_region_plot_pair(
-                        all_phase_changes, i, region_name,
-                        width // 2, plot_size
-                    )
-                    
-                    # Add plot to the combined frame
-                    if y_end <= combined_height and x_end <= combined_width:
-                        combined_frame[y_start:y_end, x_start:x_end, :] = region_plot
-                except Exception as e:
-                    print(f"Error creating plot for region {region_name} at frame {i}: {str(e)}")
+            # Store the current position for tracking
+            current_frame_position = i
+            total_video_frames = min_frames
             
-            # Add heart rate and pulse signal plots if available
-            if bpm_data:
-                # Position for heart rate plots (on the second row)
-                y_start = video_height + plot_size if num_motion_plots > 0 else video_height
+            # Create individual plots for frame-to-frame and raw changes for each region
+            # Define the ordering of regions to match image: Nose, Left Eye, Right Eye
+            ordered_regions = []
+            # First ensure we have nose_tip
+            nose_region = next((r for r in motion_regions_to_plot if 'nose_tip' in r), None)
+            if nose_region:
+                ordered_regions.append(nose_region)
+            
+            # Then add left eye
+            left_eye_region = next((r for r in motion_regions_to_plot if 'left_eye' in r), None)
+            if left_eye_region:
+                ordered_regions.append(left_eye_region)
+                
+            # Then add right eye
+            right_eye_region = next((r for r in motion_regions_to_plot if 'right_eye' in r), None)
+            if right_eye_region:
+                ordered_regions.append(right_eye_region)
+                
+            # Add any remaining regions not explicitly ordered
+            for region in motion_regions_to_plot:
+                if region not in ordered_regions:
+                    ordered_regions.append(region)
+            
+            # Create plots for each region and place them in the grid
+            for row_idx, region_name in enumerate(ordered_regions):
+                y_start = video_height + (row_idx * plot_size)
                 y_end = y_start + plot_size
                 
-                # Position for Heart Rate plot (left half)
-                x_start = 0
-                x_end = combined_width // 2
+                # Get data for this region
+                region_data = all_phase_changes.get(region_name, [])
                 
-                # Generate and add heart rate plot
+                # Get display name for the region
+                if "left_eye" in region_name:
+                    display_name = "Left Eye"
+                elif "right_eye" in region_name:
+                    display_name = "Right Eye"
+                elif "nose_tip" in region_name or "nose" in region_name:
+                    display_name = "Nose"
+                else:
+                    display_name = region_name.replace('face1_', '').replace('_', ' ').title()
+                
                 try:
+                    # Column 1: Frame-to-Frame changes plot (left position)
+                    ftf_plot = self.create_single_plot(
+                        region_data, current_frame_position, width, plot_size, 
+                        "diff", f"{display_name} Frame-to-Frame", total_video_frames
+                    )
+                    # Place Frame-to-Frame plot in column 1
+                    x_start_ftf = 0
+                    x_end_ftf = width
+                    combined_frame[y_start:y_end, x_start_ftf:x_end_ftf, :] = ftf_plot
+                    
+                    # Column 2: Raw phase plot (middle position)
+                    raw_plot = self.create_single_plot(
+                        region_data, current_frame_position, width, plot_size, 
+                        "raw", f"{display_name} Raw", total_video_frames
+                    )
+                    # Place Raw plot in column 2
+                    x_start_raw = width
+                    x_end_raw = width * 2
+                    combined_frame[y_start:y_end, x_start_raw:x_end_raw, :] = raw_plot
+                except Exception as e:
+                    print(f"Error creating plots for region {region_name} at frame {i}: {str(e)}")
+            
+            # Add heart rate and pulse signal plots if available in the third column
+            if bpm_data:
+                try:
+                    # Heart Rate plot (first row, third column)
                     heart_rate_plot = self.create_heart_rate_plot(
-                        bpm_data, i, combined_width // 2, plot_size
+                        bpm_data, current_frame_position, width, plot_size
                     )
-                    combined_frame[y_start:y_end, x_start:x_end, :] = heart_rate_plot
-                except Exception as e:
-                    print(f"Error creating heart rate plot at frame {i}: {str(e)}")
-                
-                # Position for Pulse Signal plot (right half)
-                x_start = combined_width // 2
-                x_end = combined_width
-                
-                # Generate and add pulse signal plot
-                try:
+                    
+                    # Place in first row, third column
+                    hr_y_start = video_height
+                    hr_y_end = hr_y_start + plot_size
+                    hr_x_start = width * 2
+                    hr_x_end = width * 3
+                    combined_frame[hr_y_start:hr_y_end, hr_x_start:hr_x_end, :] = heart_rate_plot
+                    
+                    # Pulse Signal plot (second row, third column)
                     pulse_signal_plot = self.create_pulse_signal_plot(
-                        bpm_data, i, combined_width // 2, plot_size
+                        bpm_data, current_frame_position, width, plot_size
                     )
-                    combined_frame[y_start:y_end, x_start:x_end, :] = pulse_signal_plot
+                    
+                    # Place in second row, third column
+                    pulse_y_start = video_height + plot_size
+                    pulse_y_end = pulse_y_start + plot_size
+                    pulse_x_start = width * 2
+                    pulse_x_end = width * 3
+                    
+                    if pulse_y_end <= combined_height:  # Make sure it's not out of bounds
+                        combined_frame[pulse_y_start:pulse_y_end, pulse_x_start:pulse_x_end, :] = pulse_signal_plot
                 except Exception as e:
-                    print(f"Error creating pulse signal plot at frame {i}: {str(e)}")
+                    print(f"Error creating heart rate/pulse plots at frame {i}: {str(e)}")
             
             # Write the combined frame
             out.write(combined_frame)
