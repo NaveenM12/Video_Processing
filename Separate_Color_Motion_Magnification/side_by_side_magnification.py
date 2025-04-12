@@ -1433,8 +1433,9 @@ class SideBySideMagnification:
         video_height = int(height * 0.5)  # Use 50% of the original height for videos (reduced from 60%)
         video_width = int((width * video_height) / height)  # Maintain aspect ratio
         
-        # Configure graph layout
-        plot_size = 300  # Size of each square plot (both width and height) - increased from 250
+        # Configure graph layout - make plots match the width of each video column
+        plot_width = width  # Each plot will be as wide as a video column
+        plot_height = 300   # Consistent height for all plots
         
         # Ensure we only plot the three main regions plus heart rate
         main_regions = ['face1_left_eye', 'face1_right_eye', 'face1_nose_tip']
@@ -1502,7 +1503,7 @@ class SideBySideMagnification:
         total_plot_rows = num_motion_regions  # One row for each motion region
         
         # Calculate total height needed for all plots
-        total_plot_height = total_plot_rows * plot_size
+        total_plot_height = total_plot_rows * plot_height
         
         # Calculate combined frame dimensions: videos on top, plots below
         combined_height = video_height + total_plot_height
@@ -1515,6 +1516,7 @@ class SideBySideMagnification:
         print(f"Creating output video: {combined_width}x{combined_height}, with {total_plot_rows} rows of plots")
         print(f"Displaying graphs for regions: {[r.replace('face1_', '') for r in motion_regions_to_plot]}")
         
+        # Process frames with motion magnification and generate combined output video
         for i in range(min_frames):
             # Create a blank combined frame
             combined_frame = np.zeros((combined_height, combined_width, 3), dtype=np.uint8)
@@ -1525,9 +1527,9 @@ class SideBySideMagnification:
             color_resized = cv2.resize(color_frames[i], (video_width, video_height))
             
             # Add labels to the video frames - include slow motion indication (0.5x speed)
-            original_labeled = self.add_label(original_resized, f"{ORIGINAL_LABEL}")
-            motion_labeled = self.add_label(motion_resized, f"{MOTION_LABEL}")
-            color_labeled = self.add_label(color_resized, f"{COLOR_LABEL}")
+            original_labeled = self.add_label(original_resized, f"{ORIGINAL_LABEL} (0.5x)")
+            motion_labeled = self.add_label(motion_resized, f"{MOTION_LABEL} (0.5x)")
+            color_labeled = self.add_label(color_resized, f"{COLOR_LABEL} (0.5x)")
             
             # Calculate horizontal positions to center videos
             video_margin = (width - video_width) // 2
@@ -1577,8 +1579,8 @@ class SideBySideMagnification:
                 if 'mouth' in region_name:
                     continue
                     
-                y_start = video_height + (row_idx * plot_size)
-                y_end = y_start + plot_size
+                y_start = video_height + (row_idx * plot_height)
+                y_end = y_start + plot_height
                 
                 # Get data for this region
                 region_data = all_phase_changes.get(region_name, [])
@@ -1596,21 +1598,21 @@ class SideBySideMagnification:
                 try:
                     # Column 1: Frame-to-Frame changes plot (left position)
                     ftf_plot = self.create_single_plot(
-                        region_data, current_frame_position, width, plot_size, 
+                        region_data, current_frame_position, plot_width, plot_height, 
                         "diff", f"{display_name} Frame-to-Frame", total_video_frames
                     )
-                    # Place Frame-to-Frame plot in column 1
-                    x_start_ftf = 0
-                    x_end_ftf = width
+                    # Place Frame-to-Frame plot in column 1 - distribute evenly across width
+                    x_start_ftf = width * 0
+                    x_end_ftf = width * 1
                     combined_frame[y_start:y_end, x_start_ftf:x_end_ftf, :] = ftf_plot
                     
                     # Column 2: Raw phase plot (middle position)
                     raw_plot = self.create_single_plot(
-                        region_data, current_frame_position, width, plot_size, 
+                        region_data, current_frame_position, plot_width, plot_height, 
                         "raw", f"{display_name} Raw", total_video_frames
                     )
-                    # Place Raw plot in column 2
-                    x_start_raw = width
+                    # Place Raw plot in column 2 - distribute evenly across width
+                    x_start_raw = width * 1
                     x_end_raw = width * 2
                     combined_frame[y_start:y_end, x_start_raw:x_end_raw, :] = raw_plot
                 except Exception as e:
@@ -1621,31 +1623,46 @@ class SideBySideMagnification:
                 try:
                     # Heart Rate plot (first row, third column)
                     heart_rate_plot = self.create_heart_rate_plot(
-                        bpm_data, current_frame_position, width, plot_size
+                        bpm_data, current_frame_position, plot_width, plot_height
                     )
                     
-                    # Place in first row, third column
+                    # Place in first row, third column - distribute evenly across width
                     hr_y_start = video_height
-                    hr_y_end = hr_y_start + plot_size
+                    hr_y_end = hr_y_start + plot_height
                     hr_x_start = width * 2
                     hr_x_end = width * 3
                     combined_frame[hr_y_start:hr_y_end, hr_x_start:hr_x_end, :] = heart_rate_plot
                     
                     # Pulse Signal plot (second row, third column)
                     pulse_signal_plot = self.create_pulse_signal_plot(
-                        bpm_data, current_frame_position, width, plot_size
+                        bpm_data, current_frame_position, plot_width, plot_height
                     )
                     
-                    # Place in second row, third column
-                    pulse_y_start = video_height + plot_size
-                    pulse_y_end = pulse_y_start + plot_size
+                    # Place in second row, third column - distribute evenly across width
+                    pulse_y_start = video_height + plot_height
+                    pulse_y_end = pulse_y_start + plot_height
                     pulse_x_start = width * 2
                     pulse_x_end = width * 3
                     
                     if pulse_y_end <= combined_height:  # Make sure it's not out of bounds
                         combined_frame[pulse_y_start:pulse_y_end, pulse_x_start:pulse_x_end, :] = pulse_signal_plot
+                        
+                    # Add information panel in the bottom right slot (third row, third column)
+                    info_panel = self.create_info_panel(
+                        current_frame_position, total_video_frames, bpm_data, plot_width, plot_height
+                    )
+                    
+                    # Place in third row, third column - distribute evenly across width
+                    info_y_start = video_height + (2 * plot_height)
+                    info_y_end = info_y_start + plot_height
+                    info_x_start = width * 2
+                    info_x_end = width * 3
+                    
+                    if info_y_end <= combined_height:  # Make sure it's not out of bounds
+                        combined_frame[info_y_start:info_y_end, info_x_start:info_x_end, :] = info_panel
+                        
                 except Exception as e:
-                    print(f"Error creating heart rate/pulse plots at frame {i}: {str(e)}")
+                    print(f"Error creating plots at frame {i}: {str(e)}")
             
             # Write the combined frame
             out.write(combined_frame)
@@ -1667,6 +1684,128 @@ class SideBySideMagnification:
                 os.remove(color_output_path)
         
         print("Processing complete!")
+    
+    def create_info_panel(self, frame_idx, total_frames, bpm_data, plot_width, plot_height):
+        """Creates an information panel with useful stats and parameters
+        
+        Args:
+            frame_idx: Current frame index
+            total_frames: Total frames in video
+            bpm_data: Heart rate data tuple
+            plot_width: Width of the plot in pixels
+            plot_height: Height of the plot in pixels
+            
+        Returns:
+            Info panel image as numpy array
+        """
+        try:
+            # Create figure with the same size as other plots
+            fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
+            ax = fig.add_subplot(1, 1, 1)
+            
+            # Remove axis for cleaner look
+            ax.axis('off')
+            
+            # Extract BPM data if available
+            current_bpm = "N/A"
+            if bpm_data is not None:
+                inst_bpm, avg_bpm, _ = bpm_data
+                if frame_idx < len(avg_bpm):
+                    current_bpm = f"{avg_bpm[frame_idx]:.1f}"
+            
+            # Calculate progress percentage
+            progress = (frame_idx / total_frames) * 100 if total_frames > 0 else 0
+            
+            # Get motion magnification parameters from config
+            motion_params = {
+                "Phase Mag": f"{MOTION_MAG_PARAMS.get('phase_mag', 'N/A')}",
+                "Freq Range": f"{MOTION_MAG_PARAMS.get('f_lo', 'N/A'):.2f}-{MOTION_MAG_PARAMS.get('f_hi', 'N/A'):.2f} Hz",
+                "Sigma": f"{MOTION_MAG_PARAMS.get('sigma', 'N/A')}"
+            }
+            
+            # Get color magnification parameters from config
+            color_params = {
+                "Alpha": f"{COLOR_MAG_PARAMS.get('alpha', 'N/A')}",
+                "Low Freq": f"{COLOR_MAG_PARAMS.get('f_lo', 'N/A'):.2f} Hz",
+                "High Freq": f"{COLOR_MAG_PARAMS.get('f_hi', 'N/A'):.2f} Hz"
+            }
+            
+            # Create text content with improved formatting and larger font size
+            # Removed "regions analyzed" section to reduce clutter and allow larger text
+            info_text = (
+                f"Frame: {frame_idx+1}/{total_frames} ({progress:.1f}%)\n"
+                f"Current Heart Rate: {current_bpm} BPM\n"
+                f"Playback Speed: 0.5x\n\n"
+                "MOTION MAGNIFICATION (PBM)\n"
+                f"• Phase Amp: {motion_params['Phase Mag']}x\n"
+                f"• Freq Band: {motion_params['Freq Range']}\n"
+                f"• Filter: σ={motion_params['Sigma']}\n\n"
+                "COLOR MAGNIFICATION (EVM)\n"
+                f"• Alpha: {color_params['Alpha']}\n"
+                f"• Freq Band: {color_params['Low Freq']} -\n  {color_params['High Freq']}"
+            )
+            
+            # Add the text content with even larger font size directly
+            # No separate title, centered in the panel
+            ax.text(0.5, 0.5, info_text, 
+                  horizontalalignment='center', 
+                  verticalalignment='center',  # Center vertically instead of top alignment
+                  transform=ax.transAxes,
+                  fontsize=22,  # Significantly increased font size from 16 to 22
+                  family='monospace',
+                  weight='bold',  
+                  bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=1'))
+            
+            # Save to image
+            buf = BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            
+            # Convert to numpy array
+            img_pil = Image.open(buf)
+            # Convert to RGB explicitly to remove alpha channel
+            if img_pil.mode == 'RGBA':
+                img_pil = img_pil.convert('RGB')
+            plot_img = np.array(img_pil)
+            
+            # Close buffer and figure
+            buf.close()
+            plt.close(fig)
+            
+            # Create a padded image with white background
+            padding = max(int(plot_width * 0.02), 5)  # Reduce padding to 2% or minimum 5px
+            padded_img = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+            
+            # Resize to fit in the padded area while maintaining aspect ratio
+            h, w = plot_img.shape[:2]
+            target_w = plot_width - (2 * padding)
+            target_h = plot_height - (2 * padding)
+            
+            # Calculate resize dimensions
+            if h/w > target_h/target_w:  # Height limited
+                resize_h = target_h
+                resize_w = min(int(w * (resize_h / h)), target_w)
+            else:  # Width limited
+                resize_w = target_w
+                resize_h = min(int(h * (resize_w / w)), target_h)
+                
+            # Resize image
+            if h != resize_h or w != resize_w:
+                plot_img = cv2.resize(plot_img, (resize_w, resize_h))
+            
+            # Calculate position to center in padded image
+            x_offset = padding + (target_w - resize_w) // 2
+            y_offset = padding + (target_h - resize_h) // 2
+            
+            # Place in padded image
+            padded_img[y_offset:y_offset+resize_h, x_offset:x_offset+resize_w] = plot_img
+            
+            return padded_img
+            
+        except Exception as e:
+            print(f"Error creating info panel: {str(e)}")
+            # Return blank white image on error
+            return np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
 
 
 if __name__ == "__main__":
