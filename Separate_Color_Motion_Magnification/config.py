@@ -35,8 +35,8 @@ LABEL_ALPHA = 0.7           # Transparency factor for label background
 
 # Labels for the videos
 ORIGINAL_LABEL = "Original"
-MOTION_LABEL = "Motion Magnified"
-COLOR_LABEL = "Color Magnified"
+MOTION_LABEL = "PBM"
+COLOR_LABEL = "EVM"
 
 # Facial Region Detection Parameters
 # Regions of interest for micro-expression detection during speech

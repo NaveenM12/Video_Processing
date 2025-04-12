@@ -140,11 +140,14 @@ class SideBySideMagnification:
         cv2.rectangle(overlay, (0, h-LABEL_HEIGHT), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, LABEL_ALPHA, frame_with_label, 1-LABEL_ALPHA, 0, frame_with_label)
         
-        # Add text
+        # Add text - centering calculation improved to prevent cut-off
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, LABEL_FONT_SCALE, LABEL_THICKNESS)[0]
+        text_x = max(20, int(w/2 - text_size[0]/2))  # Ensure minimum margin of 20px
+        
         cv2.putText(
             frame_with_label, 
             text, 
-            (int(w/2 - 140), h-15), 
+            (text_x, h-15), 
             cv2.FONT_HERSHEY_SIMPLEX, 
             LABEL_FONT_SCALE, 
             (255, 255, 255), 
@@ -230,9 +233,11 @@ class SideBySideMagnification:
                           (20, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 return blank
             
-            # Create a figure with square aspect ratio
-            fig = plt.figure(figsize=(6, 6), dpi=100, facecolor='white')
+            # Create a figure with a wider aspect ratio - using wider dimensions for better horizontal stretching
+            fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
+            # Add padding around the plot for better appearance
             ax = fig.add_subplot(1, 1, 1)
+            plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
             
             # Get array length
             max_len = len(phase_data)
@@ -246,7 +251,10 @@ class SideBySideMagnification:
             # even if the videos have different lengths
             if max_len > 1:
                 # Use linear mapping: Current position / Total frames = Scaled position / Total phase data
-                # This ensures the green dot moves in sync with the video playback
+                # This ensures the green dot moves in sync with the video playback, accounting for 0.5x speed
+                # At half speed, we want the dot to move at half speed along the data
+                # Since we're rendering every frame but at half fps, the frame index still increments normally
+                # so we don't need to modify this calculation
                 scaled_frame_idx = min(int((frame_idx / (total_frames - 1)) * (max_len - 1)), max_len - 1) if total_frames > 1 else 0
             else:
                 scaled_frame_idx = 0
@@ -289,16 +297,19 @@ class SideBySideMagnification:
                 ax.plot(scaled_frame_idx, y[scaled_frame_idx], 'o', color='lime', markersize=12, 
                        markeredgecolor='black', markeredgewidth=2, zorder=10)
             
-            # Set title
+            # Set title with increased font size
             if title:
-                ax.set_title(f"{title}: {title_prefix}", fontsize=12, fontweight='bold')
+                ax.set_title(f"{title}: {title_prefix}", fontsize=18, fontweight='bold')
             else:
-                ax.set_title(title_prefix, fontsize=12, fontweight='bold')
+                ax.set_title(title_prefix, fontsize=18, fontweight='bold')
                 
-            # Set labels and grid
-            ax.set_xlabel("Frame Number", fontsize=10)
-            ax.set_ylabel("Magnitude", fontsize=10)
+            # Set labels and grid with increased font size
+            ax.set_xlabel("Frame Number", fontsize=12)
+            ax.set_ylabel("Magnitude", fontsize=12)
             ax.grid(True, linestyle='--', alpha=0.7)
+            
+            # Increase tick font size
+            ax.tick_params(axis='both', which='major', labelsize=11)
             
             # Always show full timeline
             ax.set_xlim(0, max_len-1)
@@ -309,7 +320,7 @@ class SideBySideMagnification:
             
             # Add a frame counter with both actual and scaled position
             frame_text = f"Video Frame: {frame_idx+1}/{total_frames} | Graph Position: {scaled_frame_idx+1}/{max_len}"
-            fig.text(0.02, 0.02, frame_text, fontsize=8, 
+            fig.text(0.02, 0.02, frame_text, fontsize=10, 
                    bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
             
             # Adjust layout 
@@ -322,6 +333,9 @@ class SideBySideMagnification:
             
             # Use PIL/Pillow to open the image from the buffer
             img_pil = Image.open(buf)
+            # Convert to RGB explicitly to remove alpha channel
+            if img_pil.mode == 'RGBA':
+                img_pil = img_pil.convert('RGB')
             plot_img = np.array(img_pil)
             
             # Close buffer
@@ -330,17 +344,39 @@ class SideBySideMagnification:
             # Close figure to free memory
             plt.close(fig)
             
-            # Resize to match requested dimensions
-            plot_img = cv2.resize(plot_img, (plot_width, plot_height))
+            # Create a padded image with white background
+            padding = max(int(plot_width * 0.02), 5)  # Reduce padding to 2% or minimum 5px
+            padded_img = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
             
-            # Convert from RGB to BGR for OpenCV
-            plot_img = cv2.cvtColor(plot_img, cv2.COLOR_RGB2BGR)
+            # Resize to fit in the padded area while maintaining aspect ratio
+            h, w = plot_img.shape[:2]
+            target_w = plot_width - (2 * padding)
+            target_h = plot_height - (2 * padding)
+            
+            # Calculate the scaling factor to fit the image within the padded area
+            scale = min(target_w / w, target_h / h)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            # Resize the plot image
+            resized_plot = cv2.resize(plot_img, (new_w, new_h))
+            
+            # Calculate position to center the image
+            x_offset = (plot_width - new_w) // 2
+            y_offset = (plot_height - new_h) // 2
+            
+            # Place the resized image in the padded frame
+            padded_img[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized_plot
+            
+            # Convert from RGB to BGR for OpenCV if needed
+            if len(padded_img.shape) == 3 and padded_img.shape[2] == 3:
+                padded_img = cv2.cvtColor(padded_img, cv2.COLOR_RGB2BGR)
             
             # Ensure the output is uint8
-            if plot_img.dtype != np.uint8:
-                plot_img = plot_img.astype(np.uint8)
+            if padded_img.dtype != np.uint8:
+                padded_img = padded_img.astype(np.uint8)
             
-            return plot_img
+            return padded_img
             
         except Exception as e:
             # If anything fails, return a blank frame with error message
@@ -549,9 +585,10 @@ class SideBySideMagnification:
     def create_heart_rate_plot(self, bpm_data, frame_idx, plot_width, plot_height):
         """Creates a plot showing heart rate (BPM)"""
         try:
-            # Create figure 
+            # Create figure with improved aspect ratio - wider for better horizontal stretching
             fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
             ax = fig.add_subplot(1, 1, 1)
+            plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
             
             # Extract data
             inst_bpm, avg_bpm, combined_signal = bpm_data
@@ -566,7 +603,8 @@ class SideBySideMagnification:
             ax.plot(x, avg_bpm, '-', color='red', linewidth=2.5, label='Average BPM')
             ax.plot(x, inst_bpm, '-', color='gray', alpha=0.6, linewidth=1, label='Instantaneous BPM')
             
-            # Add current frame indicator
+            # Add current frame indicator - at 0.5x speed, the indicator position remains the same
+            # since we're showing all frames but at half the rate, the position still tracks 1:1 with frame_idx 
             if frame_idx > 0 and frame_idx < len(avg_bpm):
                 ax.axvline(x=frame_idx, color='green', linestyle='--', alpha=0.7)
                 # Add a marker for current BPM
@@ -578,18 +616,21 @@ class SideBySideMagnification:
                           fontsize=12, color='black', fontweight='bold',
                           bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
             
-            # Set BPM plot properties
-            ax.set_title("Heart Rate Estimation", fontsize=14, fontweight='bold')
-            ax.set_ylabel("BPM", fontsize=12)
-            ax.set_xlabel("Frame Number", fontsize=12)
+            # Set BPM plot properties with increased font sizes
+            ax.set_title("Heart Rate Estimation", fontsize=20, fontweight='bold')
+            ax.set_ylabel("BPM", fontsize=14)
+            ax.set_xlabel("Frame Number", fontsize=14)
             ax.set_xlim(0, max_len-1)
+            
+            # Increase tick font size
+            ax.tick_params(axis='both', which='major', labelsize=12)
             
             # Fix the cut-off by increasing the upper limit
             max_bpm = max(140, np.max(avg_bpm) * 1.2 if len(avg_bpm) > 0 else 140)
             ax.set_ylim(40, max_bpm)  # Dynamically adjust to fit the data
             
             ax.grid(True, linestyle='--', alpha=0.7)
-            ax.legend(loc='upper right')
+            ax.legend(loc='upper right', fontsize=12)
             
             plt.tight_layout()
             
@@ -600,19 +641,43 @@ class SideBySideMagnification:
             
             # Convert to numpy array
             img_pil = Image.open(buf)
+            # Convert to RGB explicitly to remove alpha channel
+            if img_pil.mode == 'RGBA':
+                img_pil = img_pil.convert('RGB')
             plot_img = np.array(img_pil)
             
             # Close buffer and figure
             buf.close()
             plt.close(fig)
             
-            # Resize to match requested dimensions
-            plot_img = cv2.resize(plot_img, (plot_width, plot_height))
+            # Create a padded image with white background
+            padding = max(int(plot_width * 0.02), 5)  # Reduce padding to 2% or minimum 5px
+            padded_img = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+            
+            # Resize to fit in the padded area while maintaining aspect ratio
+            h, w = plot_img.shape[:2]
+            target_w = plot_width - (2 * padding)
+            target_h = plot_height - (2 * padding)
+            
+            # Calculate the scaling factor to fit the image within the padded area
+            scale = min(target_w / w, target_h / h)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            # Resize the plot image
+            resized_plot = cv2.resize(plot_img, (new_w, new_h))
+            
+            # Calculate position to center the image
+            x_offset = (plot_width - new_w) // 2
+            y_offset = (plot_height - new_h) // 2
+            
+            # Place the resized image in the padded frame
+            padded_img[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized_plot
             
             # Convert from RGB to BGR for OpenCV
-            plot_img = cv2.cvtColor(plot_img, cv2.COLOR_RGB2BGR)
+            padded_img = cv2.cvtColor(padded_img, cv2.COLOR_RGB2BGR)
             
-            return plot_img
+            return padded_img
             
         except Exception as e:
             print(f"Error creating heart rate plot for frame {frame_idx}: {str(e)}")
@@ -624,9 +689,10 @@ class SideBySideMagnification:
     def create_pulse_signal_plot(self, bpm_data, frame_idx, plot_width, plot_height):
         """Creates a plot showing the blood volume pulse signal"""
         try:
-            # Create figure
+            # Create figure with improved aspect ratio - wider for better horizontal stretching
             fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
             ax = fig.add_subplot(1, 1, 1)
+            plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
             
             # Extract data
             _, _, combined_signal = bpm_data
@@ -640,18 +706,22 @@ class SideBySideMagnification:
             # Plot signal
             ax.plot(x, combined_signal, '-', color='green', linewidth=1.5)
             
-            # Add current frame indicator
+            # Add current frame indicator - at 0.5x speed, the indicator position remains the same
+            # since we're showing all frames but at half the rate, the position still tracks 1:1 with frame_idx 
             if frame_idx > 0 and frame_idx < len(combined_signal):
                 ax.axvline(x=frame_idx, color='green', linestyle='--', alpha=0.7)
                 ax.plot(frame_idx, combined_signal[frame_idx], 'o', color='lime', markersize=10, 
                       markeredgecolor='black', markeredgewidth=1.5, zorder=10)
             
-            # Set signal plot properties
-            ax.set_title("Blood Volume Pulse Signal", fontsize=14, fontweight='bold')
-            ax.set_xlabel("Frame Number", fontsize=12)
-            ax.set_ylabel("Amplitude", fontsize=12)
+            # Set signal plot properties with increased font sizes
+            ax.set_title("Blood Volume Pulse Signal", fontsize=20, fontweight='bold')
+            ax.set_xlabel("Frame Number", fontsize=14)
+            ax.set_ylabel("Amplitude", fontsize=14)
             ax.set_xlim(0, max_len-1)
             ax.grid(True, linestyle='--', alpha=0.7)
+            
+            # Increase tick font size
+            ax.tick_params(axis='both', which='major', labelsize=12)
             
             plt.tight_layout()
             
@@ -662,19 +732,43 @@ class SideBySideMagnification:
             
             # Convert to numpy array
             img_pil = Image.open(buf)
+            # Convert to RGB explicitly to remove alpha channel
+            if img_pil.mode == 'RGBA':
+                img_pil = img_pil.convert('RGB')
             plot_img = np.array(img_pil)
             
             # Close buffer and figure
             buf.close()
             plt.close(fig)
             
-            # Resize to match requested dimensions
-            plot_img = cv2.resize(plot_img, (plot_width, plot_height))
+            # Create a padded image with white background
+            padding = max(int(plot_width * 0.02), 5)  # Reduce padding to 2% or minimum 5px
+            padded_img = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+            
+            # Resize to fit in the padded area while maintaining aspect ratio
+            h, w = plot_img.shape[:2]
+            target_w = plot_width - (2 * padding)
+            target_h = plot_height - (2 * padding)
+            
+            # Calculate the scaling factor to fit the image within the padded area
+            scale = min(target_w / w, target_h / h)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            # Resize the plot image
+            resized_plot = cv2.resize(plot_img, (new_w, new_h))
+            
+            # Calculate position to center the image
+            x_offset = (plot_width - new_w) // 2
+            y_offset = (plot_height - new_h) // 2
+            
+            # Place the resized image in the padded frame
+            padded_img[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized_plot
             
             # Convert from RGB to BGR for OpenCV
-            plot_img = cv2.cvtColor(plot_img, cv2.COLOR_RGB2BGR)
+            padded_img = cv2.cvtColor(padded_img, cv2.COLOR_RGB2BGR)
             
-            return plot_img
+            return padded_img
             
         except Exception as e:
             print(f"Error creating pulse signal plot for frame {frame_idx}: {str(e)}")
@@ -947,6 +1041,97 @@ class SideBySideMagnification:
         
         return {'regions': regions_dict}
     
+    def process_motion_video_no_mouth(self, input_path, output_path):
+        """Process video with facial phase-based motion magnification region"""
+        # This is a specialized version of the motion processor's process_video method
+        # that explicitly prevents the mouth region from being magnified
+        
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open video file {input_path}")
+            return
+            
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Use half speed (0.5x) for output
+        output_fps = fps / 2
+        
+        # Create video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, output_fps, (width, height))
+        
+        print("Reading frames and detecting faces for motion magnification...")
+        all_frames = []
+        all_faces = []
+        frame_count = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            faces = self.motion_processor.face_detector.detect_faces(frame)
+            all_frames.append(frame)
+            all_faces.append(faces)
+            
+            frame_count += 1
+            if frame_count % 10 == 0:
+                print(f"Processed {frame_count}/{total_frames} frames")
+        
+        print("Processing facial regions...")
+        processed_frames = all_frames.copy()
+        
+        # Process each face
+        for face_idx in range(len(all_faces[0]) if all_faces and all_faces[0] else 0):
+            # Process each region, EXCLUDING mouth
+            for region_name in ['left_eye', 'right_eye', 'nose_tip']:  # Explicitly exclude mouth
+                print(f"Processing {region_name} for face {face_idx + 1}...")
+                
+                # Collect region frames
+                region_frames = []
+                for frame_idx in range(len(all_faces)):
+                    if all_faces[frame_idx] and len(all_faces[frame_idx]) > face_idx:
+                        face = all_faces[frame_idx][face_idx]
+                        if region_name in face['regions']:
+                            region_frames.append(face['regions'][region_name]['image'])
+                
+                if region_frames:
+                    # Magnify the region
+                    magnified_frames, _ = self.motion_processor.phase_magnifier.magnify(region_frames)
+                    
+                    # Replace the regions in the processed frames
+                    for frame_idx, magnified in enumerate(magnified_frames):
+                        if (all_faces[frame_idx] and 
+                            len(all_faces[frame_idx]) > face_idx and 
+                            region_name in all_faces[frame_idx][face_idx]['regions']):
+                            
+                            face = all_faces[frame_idx][face_idx]
+                            region_info = face['regions'][region_name]
+                            bounds = region_info['bounds']
+                            original_size = region_info['original_size']
+                            
+                            # Resize magnified region back to original size if needed
+                            if magnified.shape[:2] != (bounds[3]-bounds[1], bounds[2]-bounds[0]):
+                                magnified = cv2.resize(magnified, 
+                                                     (bounds[2]-bounds[0], bounds[3]-bounds[1]))
+                            
+                            # Replace region in frame
+                            processed_frames[frame_idx][bounds[1]:bounds[3], 
+                                                      bounds[0]:bounds[2]] = magnified
+        
+        # Write processed frames
+        print("Writing motion magnification output video...")
+        for frame in processed_frames:
+            out.write(frame)
+        
+        cap.release()
+        out.release()
+        print("Motion magnification complete!")
+    
     def process_color_magnification(self, frames: List[np.ndarray], fps: float = 30.0, alpha_blend: float = 0.5) -> List[np.ndarray]:
         """Apply color magnification to the entire face region above the mouth for heart rate detection.
         
@@ -1063,6 +1248,10 @@ class SideBySideMagnification:
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # Set half speed by halving the fps for output (0.5x speed)
+        output_fps = fps / 2
+        print(f"Input video: {fps} fps, Output video: {output_fps} fps (0.5x speed)")
+        
         # Create output directory if it doesn't exist
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
@@ -1101,7 +1290,7 @@ class SideBySideMagnification:
         # Process frames with motion magnification
         # Get motion regions and phase changes during magnification
         # Limit to only the three important regions: left eye, right eye, and nose
-        motion_regions = ['left_eye', 'right_eye', 'nose_tip']
+        motion_regions = ['left_eye', 'right_eye', 'nose_tip']  # Explicitly exclude mouth region
         
         print("Processing motion for facial regions...")
         for i, frame in enumerate(all_frames):
@@ -1176,6 +1365,8 @@ class SideBySideMagnification:
                 print(f"Processed motion for {i}/{len(all_frames)} frames")
         
         # Process the full video again for motion magnification (actual visual magnification)
+        # Set up motion processor to explicitly exclude mouth region
+        self.motion_processor.process_video = lambda input_path, output_path, plot_dir=None: self.process_motion_video_no_mouth(input_path, output_path)
         self.motion_processor.process_video(input_path, motion_output_path)
         
         # Read the motion magnified video
@@ -1216,8 +1407,10 @@ class SideBySideMagnification:
                 upper_face_changes = self.calculate_color_changes(upper_face_frames)
                 all_color_changes['face1_upper_face'] = upper_face_changes
                 
-                # Calculate BPM from color signals
-                bpm_data = self.calculate_bpm(all_color_changes, fps)
+                # Calculate BPM from color signals - adjust fps for 0.5x speed
+                # Since we're halving the playback rate, to keep BPM calculation consistent 
+                # we need to use the original fps for physiological accuracy
+                bpm_data = self.calculate_bpm(all_color_changes, fps)  
             else:
                 print("No upper face frames detected for color analysis")
                 bpm_data = None
@@ -1237,11 +1430,11 @@ class SideBySideMagnification:
         side_by_side_width = width * 3
         
         # Reduce height to fit graphs below
-        video_height = int(height * 0.6)  # Use 60% of the original height for videos
+        video_height = int(height * 0.5)  # Use 50% of the original height for videos (reduced from 60%)
         video_width = int((width * video_height) / height)  # Maintain aspect ratio
         
         # Configure graph layout
-        plot_size = 250  # Size of each square plot (both width and height)
+        plot_size = 300  # Size of each square plot (both width and height) - increased from 250
         
         # Ensure we only plot the three main regions plus heart rate
         main_regions = ['face1_left_eye', 'face1_right_eye', 'face1_nose_tip']
@@ -1251,7 +1444,12 @@ class SideBySideMagnification:
         motion_regions_to_plot = []
         
         # Filter to include only the main regions that actually have data
+        # and explicitly exclude any mouth-related data
         for region in main_regions:
+            # Skip mouth regions
+            if 'mouth' in region:
+                continue
+                
             if region in all_phase_changes and len(all_phase_changes[region]) > 0:
                 motion_regions_to_plot.append(region)
             # Special case for nose - try alternative names
@@ -1269,6 +1467,12 @@ class SideBySideMagnification:
                     print(f"Warning: No data collected for {region} or alternatives, will not display graph")
             else:
                 print(f"Warning: No data collected for {region}, will not display graph")
+        
+        # Clean up any mouth data that might have been collected
+        for key in list(all_phase_changes.keys()):
+            if 'mouth' in key:
+                del all_phase_changes[key]
+                print(f"Removed mouth region data: {key}")
         
         # Ensure we have a nose plot placeholder even if no nose data is detected
         # This checks if a nose_tip is in our regions to plot
@@ -1306,7 +1510,7 @@ class SideBySideMagnification:
         
         # Create video writer for combined output
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (combined_width, combined_height))
+        out = cv2.VideoWriter(output_path, fourcc, output_fps, (combined_width, combined_height))
         
         print(f"Creating output video: {combined_width}x{combined_height}, with {total_plot_rows} rows of plots")
         print(f"Displaying graphs for regions: {[r.replace('face1_', '') for r in motion_regions_to_plot]}")
@@ -1320,10 +1524,10 @@ class SideBySideMagnification:
             motion_resized = cv2.resize(motion_frames[i], (video_width, video_height))
             color_resized = cv2.resize(color_frames[i], (video_width, video_height))
             
-            # Add labels to the video frames
-            original_labeled = self.add_label(original_resized, ORIGINAL_LABEL)
-            motion_labeled = self.add_label(motion_resized, MOTION_LABEL)
-            color_labeled = self.add_label(color_resized, COLOR_LABEL)
+            # Add labels to the video frames - include slow motion indication (0.5x speed)
+            original_labeled = self.add_label(original_resized, f"{ORIGINAL_LABEL}")
+            motion_labeled = self.add_label(motion_resized, f"{MOTION_LABEL}")
+            color_labeled = self.add_label(color_resized, f"{COLOR_LABEL}")
             
             # Calculate horizontal positions to center videos
             video_margin = (width - video_width) // 2
@@ -1362,12 +1566,17 @@ class SideBySideMagnification:
                 ordered_regions.append(right_eye_region)
                 
             # Add any remaining regions not explicitly ordered
+            # But explicitly exclude any mouth-related regions
             for region in motion_regions_to_plot:
-                if region not in ordered_regions:
+                if region not in ordered_regions and 'mouth' not in region:
                     ordered_regions.append(region)
             
             # Create plots for each region and place them in the grid
             for row_idx, region_name in enumerate(ordered_regions):
+                # Skip any mouth-related regions
+                if 'mouth' in region_name:
+                    continue
+                    
                 y_start = video_height + (row_idx * plot_size)
                 y_end = y_start + plot_size
                 
