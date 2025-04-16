@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from io import BytesIO
 from PIL import Image
 from scipy import signal
@@ -208,7 +209,7 @@ class SideBySideMagnification:
         
         return region, (x_min, y_min, x_max, y_max)
     
-    def create_single_plot(self, phase_data, frame_idx, plot_width, plot_height, plot_type="raw", title=None, total_frames=None):
+    def create_single_plot(self, phase_data, frame_idx, plot_width, plot_height, plot_type="raw", title=None, total_frames=None, x_min=None, x_max=None):
         """Creates a single square plot of either raw phase data or frame-to-frame changes
         
         Args:
@@ -219,6 +220,8 @@ class SideBySideMagnification:
             plot_type: "raw" or "diff" for raw phase changes or frame-to-frame differences
             title: Title to display on the plot
             total_frames: Total number of frames in the video
+            x_min: Optional global minimum x-axis value for consistent scaling (in frames)
+            x_max: Optional global maximum x-axis value for consistent scaling (in frames)
             
         Returns:
             Square plot image as numpy array
@@ -233,11 +236,12 @@ class SideBySideMagnification:
                           (20, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 return blank
             
-            # Create a figure with a wider aspect ratio - using wider dimensions for better horizontal stretching
-            fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
+            # Create a figure with a wider aspect ratio for better visibility of the full timeline
+            # Increase width to ensure entire timeline is visible
+            fig = plt.figure(figsize=(12, 5), dpi=100, facecolor='white')
             # Add padding around the plot for better appearance
             ax = fig.add_subplot(1, 1, 1)
-            plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
+            plt.subplots_adjust(left=0.08, right=0.95, top=0.85, bottom=0.15)
             
             # Get array length
             max_len = len(phase_data)
@@ -248,54 +252,174 @@ class SideBySideMagnification:
             
             # Scale frame_idx to match the phase data length
             # This ensures the green dot moves correctly across the entire graph
-            # even if the videos have different lengths
+            # regardless of video length
             if max_len > 1:
-                # Use linear mapping: Current position / Total frames = Scaled position / Total phase data
-                # This ensures the green dot moves in sync with the video playback, accounting for 0.5x speed
-                # At half speed, we want the dot to move at half speed along the data
-                # Since we're rendering every frame but at half fps, the frame index still increments normally
-                # so we don't need to modify this calculation
+                # Use linear mapping for the scaled frame index
                 scaled_frame_idx = min(int((frame_idx / (total_frames - 1)) * (max_len - 1)), max_len - 1) if total_frames > 1 else 0
             else:
                 scaled_frame_idx = 0
             
-            # Get full timeline data
-            x = np.arange(len(phase_data))
-            
+            # Prepare data for plotting
             if plot_type == "diff" and len(phase_data) > 1:
                 # Calculate derivatives for frame-to-frame changes
-                y = np.abs(np.diff(phase_data))
-                y = np.insert(y, 0, 0)  # Add zero at the beginning
-                title_prefix = "Frame-to-Frame Change Rate"
+                y_original = np.abs(np.diff(phase_data))
+                y_original = np.insert(y_original, 0, 0)  # Add zero at the beginning
                 color = 'green'
+                title_prefix = "Aggregated Movement"
             else:
                 # Raw phase data
-                y = phase_data
-                title_prefix = "Raw Phase Changes"
+                y_original = phase_data
                 color = 'blue'
+                title_prefix = "Motion Amplitude"
             
-            # Plot with assigned color
-            ax.plot(x, y, color=color, linewidth=2)
+            # Time binning to aggregate movements over intervals based on detected fps
+            fps = 30  # Default FPS
+            if total_frames is not None and 'self' in locals() and hasattr(self, 'fps'):
+                fps = self.fps  # Use detected fps if available
             
-            # Find and mark peaks
-            if plot_type == "diff":
-                try:
-                    peaks, _ = signal.find_peaks(y, height=max(0.1, np.max(y) * 0.3))
-                except ValueError:
-                    peaks = []
+            # Calculate bin size in frames to represent 0.5 second of data (reduced from 1.0 second)
+            bin_size_frames = int(fps * 0.5)  # 0.5-second bins in frames
+            
+            # Ensure we have at least one bin even for short videos
+            if bin_size_frames < 1:
+                bin_size_frames = 1
+            
+            # Set the x-axis limits early to ensure we're using the full range
+            if x_min is not None and x_max is not None:
+                full_x_min = x_min
+                full_x_max = x_max
             else:
-                try:
-                    peaks, _ = signal.find_peaks(y, height=0.3)  # Adjust height as needed
-                except ValueError:
-                    peaks = []
-                
-            if len(peaks) > 0:
-                ax.plot(peaks, y[peaks], 'ro', markersize=6)
+                full_x_min = 0
+                full_x_max = total_frames
             
-            # Add a bright green dot for current frame position - make it larger and more visible
-            if scaled_frame_idx > 0 and scaled_frame_idx < len(y):
-                ax.plot(scaled_frame_idx, y[scaled_frame_idx], 'o', color='lime', markersize=12, 
-                       markeredgecolor='black', markeredgewidth=2, zorder=10)
+            # Calculate number of bins to cover the ENTIRE frame range
+            # This ensures the bins extend across the full video duration
+            num_bins = max(1, int(np.ceil((full_x_max - full_x_min) / bin_size_frames)))
+            
+            # Initialize arrays for aggregated data
+            binned_frames = []
+            binned_values = []
+            binned_max_values = []
+            
+            # Group data into bins by frame numbers, covering the FULL video range
+            for bin_idx in range(num_bins):
+                # Calculate start and end frame indices for this bin
+                start_frame = full_x_min + (bin_idx * bin_size_frames)
+                end_frame = min(full_x_max, start_frame + bin_size_frames)
+                
+                # Map these frame indices to phase_data indices
+                if max_len > 0 and total_frames > 0:
+                    # Scale from video frame range to phase_data index range
+                    start_idx = min(max_len - 1, int((start_frame / total_frames) * max_len))
+                    end_idx = min(max_len, int((end_frame / total_frames) * max_len))
+                else:
+                    start_idx = 0
+                    end_idx = 0
+                
+                # Calculate bin center frame for x-axis (in video frame units)
+                bin_center_frame = start_frame + (end_frame - start_frame) // 2
+                binned_frames.append(bin_center_frame)
+                
+                # Get data for this bin if we have valid indices
+                if start_idx < max_len and start_idx < end_idx:
+                    bin_data = y_original[start_idx:end_idx]
+                    
+                    # For movement intensity (diff plot), use different aggregation strategies
+                    if plot_type == "diff":
+                        # Use 90th percentile instead of mean to focus on larger movements
+                        if len(bin_data) > 0:
+                            # Calculate percentile value that emphasizes larger movements
+                            bin_value = np.percentile(bin_data, 90) if len(bin_data) >= 10 else np.max(bin_data)
+                            # Also track maximum for highlighting significant movements
+                            bin_max = np.max(bin_data)
+                        else:
+                            bin_value = 0
+                            bin_max = 0
+                    else:
+                        # For raw data, use mean with some weighting toward extremes
+                        if len(bin_data) > 0:
+                            # For raw plots, calculate weighted mean that emphasizes extremes
+                            weights = np.abs(bin_data - np.mean(bin_data)) + 0.1  # Add small constant to avoid zeros
+                            bin_value = np.average(bin_data, weights=weights)
+                            bin_max = np.max(bin_data)
+                        else:
+                            bin_value = 0
+                            bin_max = 0
+                else:
+                    # No data for this bin, use the last known value or 0
+                    bin_value = binned_values[-1] if binned_values else 0
+                    bin_max = binned_max_values[-1] if binned_max_values else 0
+                
+                binned_values.append(bin_value)
+                binned_max_values.append(bin_max)
+            
+            # Convert to numpy arrays
+            binned_frames = np.array(binned_frames)
+            binned_values = np.array(binned_values)
+            binned_max_values = np.array(binned_max_values)
+            
+            # Find the bin containing the current frame for position marker
+            if frame_idx >= 0 and frame_idx <= full_x_max:
+                # Find closest bin to current frame
+                current_bin_idx = np.argmin(np.abs(binned_frames - frame_idx))
+            else:
+                current_bin_idx = 0
+            
+            # Determine threshold for "significant" movements (focusing on upper portion)
+            # Calculate the threshold as a percentage of the way from min to max
+            if len(binned_values) > 0 and np.max(binned_values) > 0:
+                # Focus on upper portion by cutting off the bottom part of movements
+                # Determine the focus threshold as a percentage of the max value
+                if plot_type == "diff":
+                    # For diff plots, focus on significant movements by setting a higher threshold
+                    focus_threshold = np.percentile(binned_values, 25)  # Bottom 25% considered baseline noise
+                else:
+                    # For raw plots, use a lower threshold to show more data
+                    focus_threshold = np.percentile(binned_values, 10)  # Bottom 10% cut off
+                
+                # Ensure the threshold isn't too high in case of very skewed data
+                if focus_threshold > np.max(binned_values) * 0.5:
+                    focus_threshold = np.max(binned_values) * 0.25
+            else:
+                focus_threshold = 0
+            
+            # Plot the aggregated data as a line graph instead of bar plot
+            # Main line connecting all points
+            ax.plot(binned_frames, binned_values, '-', color=color, linewidth=2.5, 
+                   marker='o', markersize=6, markerfacecolor=color, markeredgecolor='black',
+                   markeredgewidth=1, alpha=0.8, zorder=5)
+            
+            # Add a current position indicator
+            if current_bin_idx >= 0 and current_bin_idx < len(binned_frames):
+                # Mark the current frame bin with a vertical line
+                ax.axvline(x=binned_frames[current_bin_idx], color='gray', linestyle='--', alpha=0.7)
+                
+                # Add a bright green dot on the current point
+                ax.plot(binned_frames[current_bin_idx], binned_values[current_bin_idx], 'o', 
+                       color='lime', markersize=12, markeredgecolor='black', markeredgewidth=2, zorder=10)
+            
+            # Highlight significant movement periods (those with higher values)
+            # Find bins with values above the 75th percentile
+            if len(binned_values) > 3:  # Need enough data for percentile calculation
+                significant_threshold = np.percentile(binned_values, 75)
+                significant_bins = np.where(binned_values >= significant_threshold)[0]
+                
+                # Highlight these bins with a different color
+                if len(significant_bins) > 0:
+                    # Plot significant points in red with larger markers
+                    significant_frames = binned_frames[significant_bins]
+                    significant_values = binned_values[significant_bins]
+                    ax.plot(significant_frames, significant_values, 'o', 
+                           color='tomato', markersize=10, markeredgecolor='darkred', 
+                           markeredgewidth=1.5, alpha=0.9, zorder=7)
+                    
+                    # Connect significant points with line segments
+                    # Only if they are adjacent bins
+                    for i in range(len(significant_bins)-1):
+                        if significant_bins[i+1] - significant_bins[i] == 1:
+                            ax.plot([binned_frames[significant_bins[i]], binned_frames[significant_bins[i+1]]],
+                                  [binned_values[significant_bins[i]], binned_values[significant_bins[i+1]]],
+                                  '-', color='tomato', linewidth=3.5, alpha=0.7, zorder=6)
             
             # Set title with increased font size
             if title:
@@ -311,17 +435,92 @@ class SideBySideMagnification:
             # Increase tick font size
             ax.tick_params(axis='both', which='major', labelsize=11)
             
-            # Always show full timeline
-            ax.set_xlim(0, max_len-1)
+            # ALWAYS set the x-axis to span the full frame range
+            ax.set_xlim(full_x_min, full_x_max)
             
-            # Add a bit of padding to y-axis
-            if ax.get_ylim()[1] > 0:
-                ax.set_ylim(0, ax.get_ylim()[1] * 1.1)
+            # Set tick positions at intervals appropriate for frame numbers
+            x_range = full_x_max - full_x_min
+            if x_range > 1000:
+                tick_spacing = 200
+            elif x_range > 500:
+                tick_spacing = 100
+            elif x_range > 200:
+                tick_spacing = 50
+            else:
+                tick_spacing = 20
             
-            # Add a frame counter with both actual and scaled position
-            frame_text = f"Video Frame: {frame_idx+1}/{total_frames} | Graph Position: {scaled_frame_idx+1}/{max_len}"
-            fig.text(0.02, 0.02, frame_text, fontsize=10, 
-                   bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
+            # Set x-axis ticks at regular intervals
+            tick_positions = np.arange(
+                int(full_x_min / tick_spacing) * tick_spacing,  # Round to nearest tick_spacing
+                full_x_max + tick_spacing,
+                tick_spacing
+            )
+            ax.set_xticks(tick_positions)
+            
+            # Set y-axis limits - focus on upper portion by cutting off the bottom
+            if len(binned_values) > 0:
+                # Calculate more focused y-axis limits based on average to maximum range
+                avg_value = np.mean(binned_values)
+                max_value = np.max(binned_values)
+                min_value = np.min(binned_values)
+                padding = 0.05  # Add small padding above max value
+                
+                # For frame-to-frame plots, show more of the data range vertically
+                if plot_type == "diff":
+                    # Show more of the range - start from below the minimum value
+                    # This ensures more of the vertical range is visible
+                    y_min = min_value * 0.9  # 10% below minimum value
+                    
+                    # Set upper limit to max value plus more padding for diff plots
+                    y_max = max_value + (max_value - min_value) * 0.2  # 20% additional range above max
+                else:
+                    # For raw plots, still focus on the average to max range
+                    # Set lower limit to average value, but no less than the focus threshold
+                    y_min = max(focus_threshold, avg_value) * 0.95  # Slightly below avg for context
+                    
+                    # Set upper limit to max value plus padding
+                    y_max = max_value + padding
+                
+                # Ensure there's always some range to display
+                if y_max - y_min < 0.1:
+                    y_max = y_min + 0.1
+                
+                ax.set_ylim(y_min, y_max)
+                
+                # Add a subtle horizontal line at the average for reference
+                ax.axhline(y=avg_value, color='gray', linestyle=':', alpha=0.5, linewidth=1.0)
+                # Add text annotation for average value
+                ax.text(full_x_min + (full_x_max - full_x_min) * 0.02, avg_value, f"avg: {avg_value:.3f}", 
+                      fontsize=9, color='gray', verticalalignment='bottom',
+                      bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+                
+                # Also show min value for frame-to-frame plots
+                if plot_type == "diff":
+                    ax.text(full_x_min + (full_x_max - full_x_min) * 0.02, min_value, f"min: {min_value:.3f}", 
+                          fontsize=9, color='gray', verticalalignment='top',
+                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+                
+                # Also keep the focus threshold line
+                if focus_threshold < avg_value:
+                    ax.axhline(y=focus_threshold, color='gray', linestyle=':', alpha=0.5, linewidth=1.0)
+            
+            # Add a legend to explain the plot elements
+            legend_elements = [
+                Line2D([0], [0], color=color, marker='o', markersize=6, linewidth=2.5, 
+                     markerfacecolor=color, markeredgecolor='black',
+                     label='Movement Magnitude'),
+                Line2D([0], [0], color='tomato', marker='o', markersize=8, linewidth=3.0, 
+                     markerfacecolor='tomato', markeredgecolor='darkred',
+                     label='Significant Movement')
+            ]
+            ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+            
+            # Add informative text about the current frame
+            if current_bin_idx >= 0 and current_bin_idx < len(binned_frames):
+                current_frame = binned_frames[current_bin_idx]
+                frame_info = f"Current: Frame {frame_idx+1}/{total_frames}"
+                fig.text(0.02, 0.02, frame_info, fontsize=10, 
+                      bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
             
             # Adjust layout 
             plt.tight_layout()
@@ -582,10 +781,11 @@ class SideBySideMagnification:
             print(f"Error in calculate_bpm: {str(e)}")
             return None
     
-    def create_heart_rate_plot(self, bpm_data, frame_idx, plot_width, plot_height):
+    def create_heart_rate_plot(self, bpm_data, frame_idx, plot_width, plot_height, x_min=None, x_max=None):
         """Creates a plot showing heart rate (BPM)"""
         try:
             # Create figure with improved aspect ratio - wider for better horizontal stretching
+            # Use a fixed figure size that scales well regardless of data length
             fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
             ax = fig.add_subplot(1, 1, 1)
             plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
@@ -603,16 +803,18 @@ class SideBySideMagnification:
             ax.plot(x, avg_bpm, '-', color='red', linewidth=2.5, label='Average BPM')
             ax.plot(x, inst_bpm, '-', color='gray', alpha=0.6, linewidth=1, label='Instantaneous BPM')
             
-            # Add current frame indicator - at 0.5x speed, the indicator position remains the same
-            # since we're showing all frames but at half the rate, the position still tracks 1:1 with frame_idx 
-            if frame_idx > 0 and frame_idx < len(avg_bpm):
-                ax.axvline(x=frame_idx, color='green', linestyle='--', alpha=0.7)
+            # Add current frame indicator
+            if frame_idx > 0 and frame_idx < max_len:
+                # Scale frame_idx if necessary to fit within the data length
+                scaled_frame_idx = min(frame_idx, max_len-1)
+                
+                ax.axvline(x=scaled_frame_idx, color='green', linestyle='--', alpha=0.7)
                 # Add a marker for current BPM
-                current_bpm = avg_bpm[frame_idx]
+                current_bpm = avg_bpm[scaled_frame_idx]
                 if current_bpm > 0:
-                    ax.plot(frame_idx, current_bpm, 'o', color='lime', markersize=12, 
+                    ax.plot(scaled_frame_idx, current_bpm, 'o', color='lime', markersize=12, 
                           markeredgecolor='black', markeredgewidth=2, zorder=10)
-                    ax.text(frame_idx+5, current_bpm, f"{current_bpm:.1f} BPM", 
+                    ax.text(scaled_frame_idx+5, current_bpm, f"{current_bpm:.1f} BPM", 
                           fontsize=12, color='black', fontweight='bold',
                           bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=2))
             
@@ -620,14 +822,45 @@ class SideBySideMagnification:
             ax.set_title("Heart Rate Estimation", fontsize=20, fontweight='bold')
             ax.set_ylabel("BPM", fontsize=14)
             ax.set_xlabel("Frame Number", fontsize=14)
-            ax.set_xlim(0, max_len-1)
             
-            # Increase tick font size
-            ax.tick_params(axis='both', which='major', labelsize=12)
+            # Use consistent x-axis limits if provided
+            # For heart rate, we might need to scale the global limits to match the data length
+            if x_min is not None and x_max is not None:
+                if max_len > 0:
+                    # Scale the global limits to match the heart rate data range
+                    # (since heart rate data might not have same length as phase data)
+                    scaled_x_min = 0
+                    scaled_x_max = max_len
+                    ax.set_xlim(scaled_x_min, scaled_x_max)
+                else:
+                    ax.set_xlim(x_min, x_max)
+            else:
+                # Always use consistent x-axis limits regardless of data length
+                ax.set_xlim(0, max_len-1)
+                
+            # Set tick positions at intervals appropriate for frame numbers
+            x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
+            if x_range > 1000:
+                tick_spacing = 200
+            elif x_range > 500:
+                tick_spacing = 100
+            elif x_range > 200:
+                tick_spacing = 50
+            else:
+                tick_spacing = 20
+                
+            # Set x-axis ticks at regular intervals
+            tick_positions = np.arange(
+                int(ax.get_xlim()[0] / tick_spacing) * tick_spacing,  # Round to nearest tick_spacing
+                ax.get_xlim()[1] + tick_spacing,
+                tick_spacing
+            )
+            ax.set_xticks(tick_positions)
             
-            # Fix the cut-off by increasing the upper limit
-            max_bpm = max(140, np.max(avg_bpm) * 1.2 if len(avg_bpm) > 0 else 140)
-            ax.set_ylim(40, max_bpm)  # Dynamically adjust to fit the data
+            # Use fixed y-axis range for consistent BPM display (40-140 BPM is a normal human range)
+            # This ensures the scale doesn't change between videos
+            max_bpm = max(140, np.max(avg_bpm) * 1.1 if len(avg_bpm) > 0 and np.max(avg_bpm) > 0 else 140)
+            ax.set_ylim(40, max_bpm)
             
             ax.grid(True, linestyle='--', alpha=0.7)
             ax.legend(loc='upper right', fontsize=12)
@@ -686,10 +919,11 @@ class SideBySideMagnification:
                       (20, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             return blank
     
-    def create_pulse_signal_plot(self, bpm_data, frame_idx, plot_width, plot_height):
+    def create_pulse_signal_plot(self, bpm_data, frame_idx, plot_width, plot_height, x_min=None, x_max=None):
         """Creates a plot showing the blood volume pulse signal"""
         try:
             # Create figure with improved aspect ratio - wider for better horizontal stretching
+            # Use a fixed figure size that scales well regardless of data length
             fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
             ax = fig.add_subplot(1, 1, 1)
             plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
@@ -706,18 +940,69 @@ class SideBySideMagnification:
             # Plot signal
             ax.plot(x, combined_signal, '-', color='green', linewidth=1.5)
             
-            # Add current frame indicator - at 0.5x speed, the indicator position remains the same
-            # since we're showing all frames but at half the rate, the position still tracks 1:1 with frame_idx 
-            if frame_idx > 0 and frame_idx < len(combined_signal):
-                ax.axvline(x=frame_idx, color='green', linestyle='--', alpha=0.7)
-                ax.plot(frame_idx, combined_signal[frame_idx], 'o', color='lime', markersize=10, 
+            # Add current frame indicator with proper scaling
+            if frame_idx > 0 and frame_idx < max_len:
+                # Scale frame_idx if necessary to fit within the data length
+                scaled_frame_idx = min(frame_idx, max_len-1)
+                
+                ax.axvline(x=scaled_frame_idx, color='green', linestyle='--', alpha=0.7)
+                ax.plot(scaled_frame_idx, combined_signal[scaled_frame_idx], 'o', color='lime', markersize=10, 
                       markeredgecolor='black', markeredgewidth=1.5, zorder=10)
             
             # Set signal plot properties with increased font sizes
             ax.set_title("Blood Volume Pulse Signal", fontsize=20, fontweight='bold')
             ax.set_xlabel("Frame Number", fontsize=14)
             ax.set_ylabel("Amplitude", fontsize=14)
-            ax.set_xlim(0, max_len-1)
+            
+            # Use consistent x-axis limits if provided
+            # For pulse signal, we might need to scale the global limits to match the data length
+            if x_min is not None and x_max is not None:
+                if max_len > 0:
+                    # Scale the global limits to match the pulse data range
+                    # (since pulse data might not have same length as phase data)
+                    scaled_x_min = 0
+                    scaled_x_max = max_len
+                    ax.set_xlim(scaled_x_min, scaled_x_max)
+                else:
+                    ax.set_xlim(x_min, x_max)
+            else:
+                # Always use consistent x-axis limits regardless of data length
+                ax.set_xlim(0, max_len-1)
+                
+            # Set tick positions at intervals appropriate for frame numbers
+            x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
+            if x_range > 1000:
+                tick_spacing = 200
+            elif x_range > 500:
+                tick_spacing = 100
+            elif x_range > 200:
+                tick_spacing = 50
+            else:
+                tick_spacing = 20
+                
+            # Set x-axis ticks at regular intervals
+            tick_positions = np.arange(
+                int(ax.get_xlim()[0] / tick_spacing) * tick_spacing,  # Round to nearest tick_spacing
+                ax.get_xlim()[1] + tick_spacing,
+                tick_spacing
+            )
+            ax.set_xticks(tick_positions)
+            
+            # Use consistent y-axis scale for pulse signal
+            # Find reasonable y-limits based on the signal or use defaults
+            if len(combined_signal) > 0:
+                signal_std = np.std(combined_signal)
+                if signal_std > 0:
+                    y_max = max(1.0, np.max(combined_signal) * 1.2)
+                    y_min = min(-1.0, np.min(combined_signal) * 1.2)
+                    # Ensure symmetric to show the oscillation pattern clearly
+                    max_abs = max(abs(y_min), abs(y_max))
+                    ax.set_ylim(-max_abs, max_abs)
+                else:
+                    ax.set_ylim(-1, 1)  # Default if signal has no variation
+            else:
+                ax.set_ylim(-1, 1)  # Default if no signal
+            
             ax.grid(True, linestyle='--', alpha=0.7)
             
             # Increase tick font size
@@ -780,12 +1065,14 @@ class SideBySideMagnification:
     def compute_phase_change(self, current_frame, prev_frame):
         """Compute the phase change between two frames
         
-        This method calculates motion changes between frames using optical flow
-        or image differences for visualization purposes.
+        This method calculates motion changes between PBM-magnified frames. Since
+        the frames were already magnified by the PBM process, we use a simple
+        approach to quantify the magnified motion, with enhancements to better
+        highlight significant movements.
         
         Args:
-            current_frame: Current frame image
-            prev_frame: Previous frame image
+            current_frame: Current PBM-magnified frame 
+            prev_frame: Previous PBM-magnified frame
             
         Returns:
             Float value representing phase change magnitude
@@ -806,50 +1093,46 @@ class SideBySideMagnification:
             if current_gray.shape != prev_gray.shape:
                 current_gray = cv2.resize(current_gray, (prev_gray.shape[1], prev_gray.shape[0]))
             
-            # Try to use optical flow for better motion tracking
-            try:
-                # Calculate optical flow using Lucas-Kanade method
-                # Parameters for ShiTomasi corner detection
-                feature_params = dict(maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
-                
-                # Find corners in previous frame
-                prev_pts = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
-                
-                if prev_pts is not None and len(prev_pts) > 0:
-                    # Calculate optical flow
-                    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                        prev_gray, current_gray, prev_pts, None
-                    )
-                    
-                    # Select good points
-                    good_pts = next_pts[status == 1]
-                    good_prev_pts = prev_pts[status == 1]
-                    
-                    if len(good_pts) > 0:
-                        # Calculate the magnitude of motion
-                        diffs = good_pts - good_prev_pts
-                        magnitudes = np.sqrt(np.sum(diffs**2, axis=1))
-                        mean_magnitude = np.mean(magnitudes)
-                        
-                        # Normalize and amplify for better visualization
-                        return min(mean_magnitude / 10.0, 1.0)  # Cap at 1.0
-            except Exception as flow_err:
-                # If optical flow fails, fall back to simpler method
-                print(f"Optical flow failed, using fallback method: {str(flow_err)}")
-                
-            # Fallback: Calculate absolute difference
+            # Apply minimal Gaussian blur to reduce noise while preserving important movements
+            current_gray = cv2.GaussianBlur(current_gray, (3, 3), 0.5)
+            prev_gray = cv2.GaussianBlur(prev_gray, (3, 3), 0.5)
+            
+            # Calculate absolute difference between frames - this directly measures 
+            # the magnified motion from the PBM-magnified frames
             diff = cv2.absdiff(current_gray, prev_gray)
             
-            # Apply a little blur to reduce noise
-            diff = cv2.GaussianBlur(diff, (3, 3), 0)
+            # Use a more non-linear approach to accentuate significant movements
+            # This will make deceptive micro-expressions stand out better
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to enhance local contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced_diff = clahe.apply(diff)
             
-            # Return mean of differences as a simple measure of change
-            # Amplify the result for better visualization
-            return min(np.mean(diff) / 50.0, 1.0)  # Cap at 1.0 for normalization
+            # Calculate statistics on the enhanced difference
+            avg_diff = np.mean(enhanced_diff) 
+            max_diff = np.max(enhanced_diff)
+            
+            # Calculate a weighted score that emphasizes larger differences
+            # This gives more weight to potentially deceptive movements
+            # (movements that are significantly larger than average)
+            if max_diff > 0:
+                # Calculate a weight factor: higher for frames with larger max differences
+                weight_factor = np.log1p(max_diff / (avg_diff + 1e-5))
+                weighted_diff = avg_diff * (1 + weight_factor)
+                
+                # Further normalize using a power function to enhance larger spikes
+                # This ensures small natural movements are de-emphasized while
+                # preserving pronounced movements that may indicate deception
+                normalized_diff = np.power(weighted_diff / 50.0, 0.7) * 1.2
+            else:
+                normalized_diff = 0.0
+            
+            # Return normalized value, with a minimum floor to avoid zeros
+            # and a maximum cap to prevent extreme outliers
+            return max(min(normalized_diff, 1.0), 0.01)
             
         except Exception as e:
             print(f"Error in compute_phase_change: {str(e)}")
-            return 0.1  # Return small non-zero value on error for better visualization
+            return 0.01  # Return small non-zero value on error for visualization
     
     def detect_micro_expression_regions(self, frame: np.ndarray) -> Dict:
         """Detect facial regions for micro-expression analysis"""
@@ -910,7 +1193,7 @@ class SideBySideMagnification:
                             'original_size': self.REGION_DIMENSIONS['eye_corner']
                         }
             
-            # Add explicit nose region detection
+            # Add explicit nose landmark indices
             # This is a critical part for tracking nose movements
             for region_name, indices in self.NOSE_LANDMARKS.items():
                 center = self.get_region_center(landmarks, indices)
@@ -1248,6 +1531,9 @@ class SideBySideMagnification:
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # Store fps as instance variable for use in other methods
+        self.fps = fps
+        
         # Set half speed by halving the fps for output (0.5x speed)
         output_fps = fps / 2
         print(f"Input video: {fps} fps, Output video: {output_fps} fps (0.5x speed)")
@@ -1273,103 +1559,22 @@ class SideBySideMagnification:
         # Close the input video
         cap.release()
         
-        # Create deep copies for motion and color magnification
-        motion_frames = deepcopy(all_frames)
-        
         # Dictionaries to store phase and color changes
         all_phase_changes = {}
         all_color_changes = {}
         
         print("Applying motion magnification to micro-expression regions...")
-        # Process with motion magnification - this will focus on micro-expression regions
-        
         # Custom modification to the motion magnification to focus on micro-expression regions
         # This overrides the default regions in the FacialPhaseMagnification class
         self.motion_processor.detect_face_regions = self.detect_micro_expression_regions
         
-        # Process frames with motion magnification
-        # Get motion regions and phase changes during magnification
-        # Limit to only the three important regions: left eye, right eye, and nose
-        motion_regions = ['left_eye', 'right_eye', 'nose_tip']  # Explicitly exclude mouth region
-        
-        print("Processing motion for facial regions...")
-        for i, frame in enumerate(all_frames):
-            # Detect face regions for the current frame
-            face_data = self.detect_micro_expression_regions(frame)
-            
-            if 'regions' in face_data and len(face_data['regions']) > 0:
-                # Process each motion region
-                for region_name, region_info in face_data['regions'].items():
-                    # Check if this is one of the three key regions we want to track
-                    # Map arbitrary region names to our standardized key regions
-                    key_region = None
-                    if 'left' in region_name and 'eye' in region_name:
-                        key_region = 'left_eye'
-                    elif 'right' in region_name and 'eye' in region_name:
-                        key_region = 'right_eye'
-                    elif region_name == 'nose_tip' or 'nose' in region_name:
-                        key_region = 'nose_tip'  # Standardize all nose regions to nose_tip
-                    
-                    # Only track the three key regions
-                    if key_region:
-                        region_key = f"face1_{key_region}"
-                        # Extract the region image
-                        region_img = region_info['image']
-                        
-                        # Apply the motion magnifier to this region
-                        if i == 0:
-                            # Initialize phase tracking for this region
-                            if region_key not in all_phase_changes:
-                                all_phase_changes[region_key] = []
-                                print(f"Tracking motion for {region_key}")
-                        
-                        # Calculate phase changes between frames
-                        if i > 0:  # Need at least 2 frames for phase change
-                            # Get previous region if available
-                            prev_frame_idx = max(0, i-1)
-                            prev_face_data = self.detect_micro_expression_regions(all_frames[prev_frame_idx])
-                            
-                            if 'regions' in prev_face_data:
-                                # Find matching region in previous frame
-                                prev_region_img = None
-                                for prev_name, prev_info in prev_face_data['regions'].items():
-                                    if (('left' in prev_name and 'eye' in prev_name and key_region == 'left_eye') or
-                                        ('right' in prev_name and 'eye' in prev_name and key_region == 'right_eye') or
-                                        ('nose' in prev_name and key_region == 'nose_tip')):
-                                        prev_region_img = prev_info['image']
-                                        break
-                                
-                                if prev_region_img is not None:
-                                    phase_change = self.compute_phase_change(region_img, prev_region_img)
-                                    
-                                    # Ensure the region key exists in the dictionary
-                                    if region_key not in all_phase_changes:
-                                        all_phase_changes[region_key] = [0.0] * i  # Fill with zeros for previous frames
-                                    
-                                    all_phase_changes[region_key].append(phase_change)
-                                else:
-                                    # If previous region not found, use a small random value to avoid flat line
-                                    if region_key not in all_phase_changes:
-                                        all_phase_changes[region_key] = [0.0] * i
-                                    all_phase_changes[region_key].append(0.01)
-                            else:
-                                # No previous regions at all
-                                if region_key not in all_phase_changes:
-                                    all_phase_changes[region_key] = [0.0] * i
-                                all_phase_changes[region_key].append(0.01)
-                        else:
-                            # First frame has no phase change
-                            all_phase_changes[region_key].append(0.0)
-            
-            if i % 10 == 0:
-                print(f"Processed motion for {i}/{len(all_frames)} frames")
-        
-        # Process the full video again for motion magnification (actual visual magnification)
-        # Set up motion processor to explicitly exclude mouth region
-        self.motion_processor.process_video = lambda input_path, output_path, plot_dir=None: self.process_motion_video_no_mouth(input_path, output_path)
+        # STEP 1: Process the full video with PBM magnification first
+        # This ensures that motion magnification is applied using the PBM algorithm
+        print("Processing video with Phase-Based Motion (PBM) magnification...")
         self.motion_processor.process_video(input_path, motion_output_path)
         
-        # Read the motion magnified video
+        # STEP 2: Read the PBM-magnified video frames
+        print("Reading PBM-magnified frames...")
         motion_cap = cv2.VideoCapture(motion_output_path)
         motion_frames = []
         
@@ -1381,7 +1586,71 @@ class SideBySideMagnification:
         
         motion_cap.release()
         
-        print("Applying color magnification to entire face above mouth for heart rate detection...")
+        # STEP 3: Calculate phase changes from the PBM-magnified video frames
+        # This ensures all motion analysis is based on the PBM-magnified output
+        print("Calculating phase changes from PBM-magnified frames...")
+        motion_regions = ['left_eye', 'right_eye', 'nose_tip']  # Explicitly exclude mouth region
+        
+        for i in range(min(len(motion_frames)-1, len(all_frames)-1)):  # Need at least 2 frames for comparison
+            # Detect face regions for the current magnified frame
+            face_data = self.detect_micro_expression_regions(motion_frames[i])
+            
+            if 'regions' in face_data and len(face_data['regions']) > 0:
+                # Process each motion region
+                for region_name, region_info in face_data['regions'].items():
+                    # Check if this is one of the key regions we want to track
+                    key_region = None
+                    if 'left' in region_name and 'eye' in region_name:
+                        key_region = 'left_eye'
+                    elif 'right' in region_name and 'eye' in region_name:
+                        key_region = 'right_eye'
+                    elif region_name == 'nose_tip' or 'nose' in region_name:
+                        key_region = 'nose_tip'  # Standardize all nose regions to nose_tip
+                    
+                    # Only track the key regions
+                    if key_region:
+                        region_key = f"face1_{key_region}"
+                        # Extract the region image from the magnified frame
+                        region_img = region_info['image']
+                        
+                        # Get previous region from magnified frames
+                        prev_face_data = self.detect_micro_expression_regions(motion_frames[max(0, i-1)])
+                        
+                        if 'regions' in prev_face_data:
+                            # Find matching region in previous magnified frame
+                            prev_region_img = None
+                            for prev_name, prev_info in prev_face_data['regions'].items():
+                                if (('left' in prev_name and 'eye' in prev_name and key_region == 'left_eye') or
+                                    ('right' in prev_name and 'eye' in prev_name and key_region == 'right_eye') or
+                                    ('nose' in prev_name and key_region == 'nose_tip')):
+                                    prev_region_img = prev_info['image']
+                                    break
+                            
+                            if prev_region_img is not None:
+                                # Compute phase change between magnified frames
+                                # Using the simpler method that works directly on magnified frames
+                                phase_change = self.compute_phase_change(region_img, prev_region_img)
+                                
+                                # Ensure the region key exists in the dictionary
+                                if region_key not in all_phase_changes:
+                                    all_phase_changes[region_key] = [0.0] * i  # Fill with zeros for previous frames
+                                
+                                all_phase_changes[region_key].append(phase_change)
+                            else:
+                                # If previous region not found, use a small random value to avoid flat line
+                                if region_key not in all_phase_changes:
+                                    all_phase_changes[region_key] = [0.0] * i
+                                all_phase_changes[region_key].append(0.01)
+                        else:
+                            # No previous regions at all
+                            if region_key not in all_phase_changes:
+                                all_phase_changes[region_key] = [0.0] * i
+                            all_phase_changes[region_key].append(0.01)
+            
+            if i % 10 == 0:
+                print(f"Processed phase changes for {i}/{len(motion_frames)} frames")
+        
+        print("Applying color magnification for heart rate detection...")
         # Process with color magnification using a more conservative blend factor
         # The article recommends not over-amplifying to avoid color artifacts
         color_frames = self.process_color_magnification(all_frames, fps, alpha_blend=0.5)
@@ -1424,18 +1693,23 @@ class SideBySideMagnification:
         
         # Configure layout dimensions
         
-        # For the videos: maintain original aspect ratio but reduce size
-        # Calculate the scaling factor to fit three videos side by side
-        video_scale_factor = 0.9  # Leave some margin
-        side_by_side_width = width * 3
+        # Use fixed dimensions for consistent output regardless of input video size
+        # Set a fixed base width for each video column - increased width for better graph visibility
+        fixed_base_width = 720  # Increased from 640 to 720 for wider graphs
+        # Calculate the side by side width based on fixed size
+        side_by_side_width = fixed_base_width * 3
         
-        # Reduce height to fit graphs below
-        video_height = int(height * 0.5)  # Use 50% of the original height for videos (reduced from 60%)
-        video_width = int((width * video_height) / height)  # Maintain aspect ratio
+        # Set a fixed height for video display - standard HD half-height (maintain 16:9 aspect)
+        video_height = 360
+        # Calculate video width based on original aspect ratio, but enforce minimum width
+        aspect_ratio = width / height
+        video_width = max(int(video_height * aspect_ratio), int(fixed_base_width * 0.85))
+        # Make sure video_width doesn't exceed the column width
+        video_width = min(video_width, fixed_base_width)
         
-        # Configure graph layout - make plots match the width of each video column
-        plot_width = width  # Each plot will be as wide as a video column
-        plot_height = 300   # Consistent height for all plots
+        # Configure fixed plot dimensions - always the same size regardless of input video
+        plot_width = fixed_base_width  # Each plot will be as wide as a video column
+        plot_height = 320   # Increased from 300 to 320 for taller graphs
         
         # Ensure we only plot the three main regions plus heart rate
         main_regions = ['face1_left_eye', 'face1_right_eye', 'face1_nose_tip']
@@ -1500,7 +1774,7 @@ class SideBySideMagnification:
         num_motion_regions = len(motion_regions_to_plot)
         
         # Calculate how many rows we need - each row will contain one region's "raw" and "diff" plots
-        total_plot_rows = num_motion_regions  # One row for each motion region
+        total_plot_rows = max(num_motion_regions, 3)  # Ensure at least 3 rows for consistent layout
         
         # Calculate total height needed for all plots
         total_plot_height = total_plot_rows * plot_height
@@ -1516,12 +1790,65 @@ class SideBySideMagnification:
         print(f"Creating output video: {combined_width}x{combined_height}, with {total_plot_rows} rows of plots")
         print(f"Displaying graphs for regions: {[r.replace('face1_', '') for r in motion_regions_to_plot]}")
         
+        # Add this new section to calculate global frame limits for all plots
+        # This needs to be done before creating any plots
+        print("Calculating global frame limits for consistent x-axis across all graphs...")
+        # Initialize global min and max frame values
+        global_frame_min = float('inf')
+        global_frame_max = float('-inf')
+        
+        # Temporary dictionary to store binned frames for each region
+        all_binned_frames = {}
+        
+        # Calculate binned frames for each region to find global limits
+        bin_size_frames = int(fps)  # 1-second bins in frames
+        
+        for region_name in motion_regions_to_plot:
+            if region_name in all_phase_changes:
+                # Get data for this region
+                phase_data = all_phase_changes[region_name]
+                max_len = len(phase_data)
+                
+                # Calculate number of bins for this region
+                num_bins = max(1, int(np.ceil(max_len / bin_size_frames)))
+                
+                # Calculate binned frames
+                binned_frames = []
+                for bin_idx in range(num_bins):
+                    start_idx = bin_idx * bin_size_frames
+                    end_idx = min(max_len, (bin_idx + 1) * bin_size_frames)
+                    
+                    if start_idx < max_len:
+                        # Calculate bin center frame
+                        bin_center_frame = start_idx + (end_idx - start_idx) // 2
+                        binned_frames.append(bin_center_frame)
+                
+                if binned_frames:
+                    # Update global min and max
+                    global_frame_min = min(global_frame_min, binned_frames[0])
+                    global_frame_max = max(global_frame_max, binned_frames[-1])
+                    
+                    # Store binned frames for this region
+                    all_binned_frames[region_name] = np.array(binned_frames)
+        
+        # Safety check in case no valid regions were found
+        if global_frame_min == float('inf'):
+            global_frame_min = 0
+        if global_frame_max == float('-inf'):
+            global_frame_max = total_frames
+            
+        # Make sure the x-axis extends to the full video length
+        global_frame_min = 0
+        global_frame_max = total_frames
+        
+        print(f"Using global frame limits for all graphs: {global_frame_min} to {global_frame_max}")
+        
         # Process frames with motion magnification and generate combined output video
         for i in range(min_frames):
             # Create a blank combined frame
             combined_frame = np.zeros((combined_height, combined_width, 3), dtype=np.uint8)
             
-            # Resize the three video frames while maintaining aspect ratio
+            # Resize the three video frames to the fixed dimensions
             original_resized = cv2.resize(all_frames[i], (video_width, video_height))
             motion_resized = cv2.resize(motion_frames[i], (video_width, video_height))
             color_resized = cv2.resize(color_frames[i], (video_width, video_height))
@@ -1531,11 +1858,10 @@ class SideBySideMagnification:
             motion_labeled = self.add_label(motion_resized, f"{MOTION_LABEL} (0.5x)")
             color_labeled = self.add_label(color_resized, f"{COLOR_LABEL} (0.5x)")
             
-            # Calculate horizontal positions to center videos
-            video_margin = (width - video_width) // 2
-            x_offset1 = video_margin
-            x_offset2 = width + video_margin
-            x_offset3 = width * 2 + video_margin
+            # Calculate horizontal positions to center videos within their columns
+            x_offset1 = (fixed_base_width - video_width) // 2
+            x_offset2 = fixed_base_width + (fixed_base_width - video_width) // 2
+            x_offset3 = fixed_base_width * 2 + (fixed_base_width - video_width) // 2
             
             # Place the three videos at the top of the combined frame
             try:
@@ -1599,21 +1925,23 @@ class SideBySideMagnification:
                     # Column 1: Frame-to-Frame changes plot (left position)
                     ftf_plot = self.create_single_plot(
                         region_data, current_frame_position, plot_width, plot_height, 
-                        "diff", f"{display_name} Frame-to-Frame", total_video_frames
+                        "diff", f"{display_name} Frame-to-Frame", total_video_frames,
+                        x_min=global_frame_min, x_max=global_frame_max
                     )
                     # Place Frame-to-Frame plot in column 1 - distribute evenly across width
-                    x_start_ftf = width * 0
-                    x_end_ftf = width * 1
+                    x_start_ftf = fixed_base_width * 0
+                    x_end_ftf = fixed_base_width * 1
                     combined_frame[y_start:y_end, x_start_ftf:x_end_ftf, :] = ftf_plot
                     
                     # Column 2: Raw phase plot (middle position)
                     raw_plot = self.create_single_plot(
                         region_data, current_frame_position, plot_width, plot_height, 
-                        "raw", f"{display_name} Raw", total_video_frames
+                        "raw", f"{display_name} Raw", total_video_frames,
+                        x_min=global_frame_min, x_max=global_frame_max
                     )
                     # Place Raw plot in column 2 - distribute evenly across width
-                    x_start_raw = width * 1
-                    x_end_raw = width * 2
+                    x_start_raw = fixed_base_width * 1
+                    x_end_raw = fixed_base_width * 2
                     combined_frame[y_start:y_end, x_start_raw:x_end_raw, :] = raw_plot
                 except Exception as e:
                     print(f"Error creating plots for region {region_name} at frame {i}: {str(e)}")
@@ -1623,26 +1951,28 @@ class SideBySideMagnification:
                 try:
                     # Heart Rate plot (first row, third column)
                     heart_rate_plot = self.create_heart_rate_plot(
-                        bpm_data, current_frame_position, plot_width, plot_height
+                        bpm_data, current_frame_position, plot_width, plot_height,
+                        x_min=global_frame_min, x_max=global_frame_max
                     )
                     
                     # Place in first row, third column - distribute evenly across width
                     hr_y_start = video_height
                     hr_y_end = hr_y_start + plot_height
-                    hr_x_start = width * 2
-                    hr_x_end = width * 3
+                    hr_x_start = fixed_base_width * 2
+                    hr_x_end = fixed_base_width * 3
                     combined_frame[hr_y_start:hr_y_end, hr_x_start:hr_x_end, :] = heart_rate_plot
                     
                     # Pulse Signal plot (second row, third column)
                     pulse_signal_plot = self.create_pulse_signal_plot(
-                        bpm_data, current_frame_position, plot_width, plot_height
+                        bpm_data, current_frame_position, plot_width, plot_height,
+                        x_min=global_frame_min, x_max=global_frame_max
                     )
                     
                     # Place in second row, third column - distribute evenly across width
                     pulse_y_start = video_height + plot_height
                     pulse_y_end = pulse_y_start + plot_height
-                    pulse_x_start = width * 2
-                    pulse_x_end = width * 3
+                    pulse_x_start = fixed_base_width * 2
+                    pulse_x_end = fixed_base_width * 3
                     
                     if pulse_y_end <= combined_height:  # Make sure it's not out of bounds
                         combined_frame[pulse_y_start:pulse_y_end, pulse_x_start:pulse_x_end, :] = pulse_signal_plot
@@ -1655,8 +1985,8 @@ class SideBySideMagnification:
                     # Place in third row, third column - distribute evenly across width
                     info_y_start = video_height + (2 * plot_height)
                     info_y_end = info_y_start + plot_height
-                    info_x_start = width * 2
-                    info_x_end = width * 3
+                    info_x_start = fixed_base_width * 2
+                    info_x_end = fixed_base_width * 3
                     
                     if info_y_end <= combined_height:  # Make sure it's not out of bounds
                         combined_frame[info_y_start:info_y_end, info_x_start:info_x_end, :] = info_panel
@@ -1699,7 +2029,7 @@ class SideBySideMagnification:
             Info panel image as numpy array
         """
         try:
-            # Create figure with the same size as other plots
+            # Create figure with the same fixed size as other plots
             fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
             ax = fig.add_subplot(1, 1, 1)
             
@@ -1731,7 +2061,6 @@ class SideBySideMagnification:
             }
             
             # Create text content with improved formatting and larger font size
-            # Removed "regions analyzed" section to reduce clutter and allow larger text
             info_text = (
                 f"Frame: {frame_idx+1}/{total_frames} ({progress:.1f}%)\n"
                 f"Current Heart Rate: {current_bpm} BPM\n"
@@ -1740,6 +2069,11 @@ class SideBySideMagnification:
                 f"• Phase Amp: {motion_params['Phase Mag']}x\n"
                 f"• Freq Band: {motion_params['Freq Range']}\n"
                 f"• Filter: σ={motion_params['Sigma']}\n\n"
+                "MOVEMENT ANALYSIS\n"
+                "• Red points indicate significant\n  movement periods\n"
+                "• 0.5-second aggregation window\n"
+                "• Y-axis expanded to show more\n  movement range\n"
+                "• X-axis shows frame numbers\n  across full video range\n\n"
                 "COLOR MAGNIFICATION (EVM)\n"
                 f"• Alpha: {color_params['Alpha']}\n"
                 f"• Freq Band: {color_params['Low Freq']} -\n  {color_params['High Freq']}"

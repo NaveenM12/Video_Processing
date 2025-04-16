@@ -32,9 +32,9 @@ class FaceDetector:
         
         # Define rectangle dimensions for each region (width, height)
         self.REGION_DIMENSIONS = {
-            'left_eye': (160, 140),    # Wider than tall for eyes
-            'right_eye': (160, 140),   # Wider than tall for eyes
-            'nose_tip': (130, 100),    # Square for nose
+            'left_eye': (180, 170),    # Wider than tall for eyes
+            'right_eye': (180, 170),   # Wider than tall for eyes
+            'nose_tip': (190, 100),    # Square for nose
             'mouth': (186, 80)        # Wide rectangle for full mouth
         }
 
@@ -625,7 +625,8 @@ class FacialPhaseMagnification:
         # Process each face
         for face_idx in range(len(all_faces[0])):  # For each face detected in first frame
             # Process each region
-            for region_name in ['left_eye', 'right_eye', 'nose_tip', 'mouth']:
+            # for region_name in ['left_eye', 'right_eye', 'nose_tip', 'mouth']:
+            for region_name in ['left_eye', 'right_eye', 'nose_tip']:
                 print(f"Processing {region_name} for face {face_idx + 1}...")
                 
                 # Collect region frames
@@ -677,6 +678,46 @@ class FacialPhaseMagnification:
         cap.release()
         out.release()
         print("Processing complete!")
+
+    def compute_phase_change(self, current_frame, prev_frame):
+        """Compute the phase change between frames from the PBM-magnified video
+        
+        Args:
+            current_frame: Current magnified frame
+            prev_frame: Previous magnified frame
+            
+        Returns:
+            Float value representing phase change magnitude
+        """
+        try:
+            # Convert to grayscale if not already
+            if len(current_frame.shape) == 3:
+                current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+            else:
+                current_gray = current_frame
+            
+            if len(prev_frame.shape) == 3:
+                prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+            else:
+                prev_gray = prev_frame
+            
+            # Ensure same size
+            if current_gray.shape != prev_gray.shape:
+                current_gray = cv2.resize(current_gray, (prev_gray.shape[1], prev_gray.shape[0]))
+            
+            # Simple absolute difference - the PBM already did the magnification
+            diff = cv2.absdiff(current_gray, prev_gray)
+            
+            # Apply minimal blur to reduce noise
+            diff = cv2.GaussianBlur(diff, (3, 3), 0)
+            
+            # Calculate mean difference as a measure of motion
+            # The PBM magnification has already amplified the small movements
+            return min(np.mean(diff) / 50.0, 1.0)  # Cap at 1.0 for normalization
+        
+        except Exception as e:
+            print(f"Error in compute_phase_change: {str(e)}")
+            return 0.1  # Return small non-zero value on error
 
 if __name__ == "__main__":
     # Define input and output paths
