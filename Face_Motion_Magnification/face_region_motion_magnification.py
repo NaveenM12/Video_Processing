@@ -281,16 +281,18 @@ class PhaseMagnification:
         # Store DFT of motion magnified frames
         recon_dft = torch.zeros((len(frames), h, w), dtype=torch.complex64).to(self.device)
         
-        # Track phase change magnitudes for each frame with better approach
-        # Now we'll store maximum phase changes and use weighted sum based on amplitude
-        phase_changes = np.zeros(len(frames))
-        total_weight = 0.0
+        # Create a proper storage for capturing the raw phase changes before magnification
+        # This is what we will use for visualization
+        raw_phase_changes = np.zeros(len(frames))
         
         # Reference frame (first frame)
         ref_idx = 0
         
         # Batch processing parameters
         batch_size = 4
+        
+        # Running total for normalization
+        total_amplitude_weight = 0.0
         
         # Process pyramid levels
         for level in range(1, len(filters) - 1, batch_size):
@@ -336,7 +338,7 @@ class PhaseMagnification:
                                          [idx2-idx1, 1, 1, 1]).permute(0, 3, 1, 2)
             
             # Filter in frequency domain
-            phase_deltas = torch.fft.ifft(
+            filtered_phase_deltas = torch.fft.ifft(
                 transfer_function * torch.fft.fft(phase_deltas, dim=1),
                 dim=1
             ).real
@@ -344,7 +346,7 @@ class PhaseMagnification:
             # Apply motion magnification
             for vid_idx in range(len(frames)):
                 curr_pyr = self.build_level_batch(video_dft[vid_idx], filter_batch)
-                delta = phase_deltas[:, vid_idx]
+                delta = filtered_phase_deltas[:, vid_idx]
                 
                 # Amplitude weighted blurring
                 if self.sigma != 0:
@@ -364,21 +366,22 @@ class PhaseMagnification:
                     
                     delta /= weight
                 
-                # Track phase change magnitude using a better approach
-                # Use 95th percentile to catch significant motion but avoid outliers
-                # Also weight by amplitude to focus on more important signals
+                # UPDATED: Track the raw phase changes before magnification
+                # This better represents the actual motion being detected (not magnified yet)
                 for i in range(len(avg_amplitude)):
-                    # Get 95th percentile of motion in this level/orientation
+                    # Get significant phase changes in this level/orientation
                     level_delta = torch.abs(delta[i])
+                    
+                    # Use 95th percentile to capture significant motion while avoiding outliers
                     percentile_value = torch.quantile(level_delta.flatten(), 0.95)
                     
-                    # Weight this level's contribution by its amplitude
+                    # Weight by amplitude to prioritize stronger signals
                     weight = avg_amplitude[i].item()
-                    phase_changes[vid_idx] += percentile_value.item() * weight
+                    raw_phase_changes[vid_idx] += percentile_value.item() * weight
                     
-                    # Add to total weight only on first frame
+                    # Add to total weight only on first frame for normalization
                     if vid_idx == 0:
-                        total_weight += weight
+                        total_amplitude_weight += weight
                 
                 # Modify phase variation
                 modified_phase = delta * self.phase_mag
@@ -424,14 +427,14 @@ class PhaseMagnification:
             magnified_frames.append(cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR))
         
         # Normalize by total amplitude weight for consistent scaling
-        if total_weight > 0:
-            phase_changes = phase_changes / total_weight
+        if total_amplitude_weight > 0:
+            raw_phase_changes = raw_phase_changes / total_amplitude_weight
             
         # Normalize phase change magnitudes for better visualization
-        if np.max(phase_changes) > 0:
-            phase_changes = phase_changes / np.max(phase_changes)
+        if np.max(raw_phase_changes) > 0:
+            raw_phase_changes = raw_phase_changes / np.max(raw_phase_changes)
         
-        return magnified_frames, phase_changes
+        return magnified_frames, raw_phase_changes
 
 class FacialPhaseMagnification:
     def __init__(self):
@@ -465,8 +468,8 @@ class FacialPhaseMagnification:
             
             # Plot
             axes[idx].plot(time_points, phase_changes, '-', linewidth=2)
-            axes[idx].set_title(f'{region_name.replace("_", " ").title()} Phase Changes')
-            axes[idx].set_ylabel('Magnitude')
+            axes[idx].set_title(f'{region_name.replace("_", " ").title()} - Pre-Magnification Phase Changes')
+            axes[idx].set_ylabel('Phase Change\nMagnitude')
             
             # Add grid
             axes[idx].grid(True, linestyle='--', alpha=0.7)
@@ -478,7 +481,9 @@ class FacialPhaseMagnification:
         
         # Set common labels
         plt.xlabel('Frame Number')
+        plt.suptitle('Local Phase Changes Detected by Complex Steerable Pyramid', fontsize=14)
         plt.tight_layout()
+        plt.subplots_adjust(top=0.92)
         
         # Save the figure
         plt.savefig(os.path.join(output_dir, 'phase_changes.png'), dpi=150)
@@ -498,8 +503,8 @@ class FacialPhaseMagnification:
             
             # 1. Raw phase changes plot
             axes[0].plot(time_points, phase_changes, '-', linewidth=2, color='blue')
-            axes[0].set_title(f'{region_name.replace("_", " ").title()} Raw Phase Changes')
-            axes[0].set_ylabel('Magnitude')
+            axes[0].set_title(f'{region_name.replace("_", " ").title()} - Pre-Magnification Phase Changes')
+            axes[0].set_ylabel('Phase Change\nMagnitude')
             axes[0].grid(True, linestyle='--', alpha=0.7)
             
             # Highlight peaks in raw data
@@ -514,14 +519,14 @@ class FacialPhaseMagnification:
             derivatives = np.insert(derivatives, 0, 0)
             
             axes[1].plot(time_points, derivatives, '-', linewidth=2, color='green')
-            axes[1].set_title(f'{region_name.replace("_", " ").title()} Frame-to-Frame Change Rate')
+            axes[1].set_title(f'{region_name.replace("_", " ").title()} - Rate of Phase Change')
             axes[1].set_ylabel('Rate of Change')
             axes[1].grid(True, linestyle='--', alpha=0.7)
             
             # Highlight spikes in derivative
             derivative_peaks, _ = signal.find_peaks(derivatives, height=np.max(derivatives) * 0.4)
             if len(derivative_peaks) > 0:
-                axes[1].plot(derivative_peaks, derivatives[derivative_peaks], 'ro', label='Motion Spikes')
+                axes[1].plot(derivative_peaks, derivatives[derivative_peaks], 'ro', label='Phase Spikes')
                 axes[1].legend()
             
             # 3. Frequency domain analysis (shows periodic motion)
@@ -532,9 +537,9 @@ class FacialPhaseMagnification:
                 
                 # Exclude DC component (first value)
                 axes[2].plot(freqs[1:], phase_fft[1:], '-', linewidth=2, color='purple')
-                axes[2].set_title(f'{region_name.replace("_", " ").title()} Frequency Components')
+                axes[2].set_title(f'{region_name.replace("_", " ").title()} - Frequency Analysis')
                 axes[2].set_xlabel('Frequency (cycles/frame)')
-                axes[2].set_ylabel('Amplitude')
+                axes[2].set_ylabel('Phase Component\nAmplitude')
                 axes[2].grid(True, linestyle='--', alpha=0.7)
                 
                 # Find dominant frequencies
@@ -548,19 +553,21 @@ class FacialPhaseMagnification:
                 axes[2].text(0.5, 0.5, 'Not enough frames for frequency analysis', 
                           horizontalalignment='center', verticalalignment='center',
                           transform=axes[2].transAxes)
-                axes[2].set_title(f'{region_name.replace("_", " ").title()} Frequency Components')
+                axes[2].set_title(f'{region_name.replace("_", " ").title()} - Frequency Analysis')
                 axes[2].set_xlabel('Frequency (cycles/frame)')
             
+            plt.suptitle(f'Phase-Based Motion Analysis: {region_name.replace("_", " ").title()}', fontsize=16)
             plt.tight_layout()
+            plt.subplots_adjust(top=0.92)
             plt.savefig(os.path.join(output_dir, f'{region_name}_detailed_analysis.png'), dpi=150)
             plt.close()
             
             # Also create a cleaner single plot just showing raw phase changes (original implementation)
             plt.figure(figsize=(10, 6))
             plt.plot(time_points, phase_changes, '-', linewidth=2)
-            plt.title(f'{region_name.replace("_", " ").title()} Phase Changes')
+            plt.title(f'Pre-Magnification Phase Changes: {region_name.replace("_", " ").title()}')
             plt.xlabel('Frame Number')
-            plt.ylabel('Magnitude')
+            plt.ylabel('Phase Change Magnitude')
             plt.grid(True, linestyle='--', alpha=0.7)
             
             # Highlight peaks
@@ -679,46 +686,6 @@ class FacialPhaseMagnification:
         out.release()
         print("Processing complete!")
 
-    def compute_phase_change(self, current_frame, prev_frame):
-        """Compute the phase change between frames from the PBM-magnified video
-        
-        Args:
-            current_frame: Current magnified frame
-            prev_frame: Previous magnified frame
-            
-        Returns:
-            Float value representing phase change magnitude
-        """
-        try:
-            # Convert to grayscale if not already
-            if len(current_frame.shape) == 3:
-                current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-            else:
-                current_gray = current_frame
-            
-            if len(prev_frame.shape) == 3:
-                prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-            else:
-                prev_gray = prev_frame
-            
-            # Ensure same size
-            if current_gray.shape != prev_gray.shape:
-                current_gray = cv2.resize(current_gray, (prev_gray.shape[1], prev_gray.shape[0]))
-            
-            # Simple absolute difference - the PBM already did the magnification
-            diff = cv2.absdiff(current_gray, prev_gray)
-            
-            # Apply minimal blur to reduce noise
-            diff = cv2.GaussianBlur(diff, (3, 3), 0)
-            
-            # Calculate mean difference as a measure of motion
-            # The PBM magnification has already amplified the small movements
-            return min(np.mean(diff) / 50.0, 1.0)  # Cap at 1.0 for normalization
-        
-        except Exception as e:
-            print(f"Error in compute_phase_change: {str(e)}")
-            return 0.1  # Return small non-zero value on error
-
 if __name__ == "__main__":
     # Define input and output paths
     input_video_path = "test_videos/face.mp4"
@@ -726,7 +693,6 @@ if __name__ == "__main__":
     plot_dir = "Face_Motion_Magnification/output_videos/phase_plots"
     
     # Create output directory if it doesn't exist
-    import os
     os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
     
     # Process the video
