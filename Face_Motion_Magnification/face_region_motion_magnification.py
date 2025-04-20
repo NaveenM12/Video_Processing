@@ -34,7 +34,7 @@ class FaceDetector:
         self.REGION_DIMENSIONS = {
             'left_eye': (180, 170),    # Wider than tall for eyes
             'right_eye': (180, 170),   # Wider than tall for eyes
-            'nose_tip': (190, 100),    # Square for nose
+            'nose_tip': (196, 100),    # Square for nose
             'mouth': (186, 80)        # Wide rectangle for full mouth
         }
 

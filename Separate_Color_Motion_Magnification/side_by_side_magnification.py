@@ -1977,19 +1977,20 @@ class SideBySideMagnification:
                     if pulse_y_end <= combined_height:  # Make sure it's not out of bounds
                         combined_frame[pulse_y_start:pulse_y_end, pulse_x_start:pulse_x_end, :] = pulse_signal_plot
                         
-                    # Add information panel in the bottom right slot (third row, third column)
-                    info_panel = self.create_info_panel(
-                        current_frame_position, total_video_frames, bpm_data, plot_width, plot_height
+                    # Replace info panel with aggregated movement plot (third row, third column)
+                    agg_movement_plot = self.create_aggregated_movement_plot(
+                        all_phase_changes, current_frame_position, plot_width, plot_height, 
+                        total_frames=total_video_frames, x_min=global_frame_min, x_max=global_frame_max
                     )
                     
                     # Place in third row, third column - distribute evenly across width
-                    info_y_start = video_height + (2 * plot_height)
-                    info_y_end = info_y_start + plot_height
-                    info_x_start = fixed_base_width * 2
-                    info_x_end = fixed_base_width * 3
+                    agg_y_start = video_height + (2 * plot_height)
+                    agg_y_end = agg_y_start + plot_height
+                    agg_x_start = fixed_base_width * 2
+                    agg_x_end = fixed_base_width * 3
                     
-                    if info_y_end <= combined_height:  # Make sure it's not out of bounds
-                        combined_frame[info_y_start:info_y_end, info_x_start:info_x_end, :] = info_panel
+                    if agg_y_end <= combined_height:  # Make sure it's not out of bounds
+                        combined_frame[agg_y_start:agg_y_end, agg_x_start:agg_x_end, :] = agg_movement_plot
                         
                 except Exception as e:
                     print(f"Error creating plots at frame {i}: {str(e)}")
@@ -2140,6 +2141,109 @@ class SideBySideMagnification:
             print(f"Error creating info panel: {str(e)}")
             # Return blank white image on error
             return np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+    
+    # Add a new method to create the aggregated frame-to-frame movement graph
+    def create_aggregated_movement_plot(self, all_phase_changes, frame_idx, plot_width, plot_height, total_frames=None, x_min=None, x_max=None):
+        """Creates a plot showing aggregated frame-to-frame movement across all magnified regions (eyes and nose)
+        
+        Args:
+            all_phase_changes: Dictionary with region names as keys and phase change arrays as values
+            frame_idx: Current frame index
+            plot_width: Width of the plot in pixels
+            plot_height: Height of the plot in pixels
+            total_frames: Total number of frames in the video
+            x_min: Optional global minimum x-axis value for consistent scaling
+            x_max: Optional global maximum x-axis value for consistent scaling
+            
+        Returns:
+            Aggregated movement plot as numpy array
+        """
+        try:
+            # Collect all phase changes from eyes and nose regions
+            combined_phase_data = None
+            region_weights = {'left_eye': 1.0, 'right_eye': 1.0, 'nose_tip': 1.0, 'nose': 1.0}
+            region_count = 0
+            
+            # For each region, look for matching keys in the all_phase_changes dictionary
+            for region_key, phase_data in all_phase_changes.items():
+                # Skip empty data
+                if len(phase_data) == 0:
+                    continue
+                    
+                # Skip mouth regions
+                if 'mouth' in region_key.lower():
+                    continue
+                    
+                # Find which region type this matches
+                region_type = None
+                for key in region_weights.keys():
+                    if key in region_key.lower():
+                        region_type = key
+                        break
+                
+                # Skip if no matching region type found
+                if region_type is None:
+                    continue
+                    
+                # Add to combined data if this is the first region of its type
+                if combined_phase_data is None:
+                    # Initialize with first data array
+                    combined_phase_data = np.array(phase_data) * region_weights[region_type]
+                    region_count += 1
+                else:
+                    # Ensure arrays are the same length by padding the shorter one
+                    if len(phase_data) < len(combined_phase_data):
+                        # Pad phase_data with zeros
+                        padded_data = np.pad(phase_data, (0, len(combined_phase_data) - len(phase_data)), 'constant')
+                        combined_phase_data += padded_data * region_weights[region_type]
+                        region_count += 1
+                    elif len(phase_data) > len(combined_phase_data):
+                        # Pad combined_phase_data with zeros
+                        combined_phase_data = np.pad(combined_phase_data, (0, len(phase_data) - len(combined_phase_data)), 'constant')
+                        combined_phase_data += np.array(phase_data) * region_weights[region_type]
+                        region_count += 1
+                    else:
+                        # Same length, just add weighted values
+                        combined_phase_data += np.array(phase_data) * region_weights[region_type]
+                        region_count += 1
+            
+            # If we don't have any data, return a blank plot
+            if combined_phase_data is None or len(combined_phase_data) == 0:
+                blank = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+                cv2.putText(blank, "No data for aggregated movement", 
+                          (20, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                return blank
+            
+            # Normalize the combined data by the number of regions if more than one region was combined
+            if region_count > 1:
+                combined_phase_data = combined_phase_data / region_count
+            
+            # Normalize the combined data to avoid scaling issues
+            max_val = np.max(combined_phase_data)
+            if max_val > 0:
+                combined_phase_data = combined_phase_data / max_val
+            
+            # Calculate frame-to-frame differences to show movement
+            if len(combined_phase_data) > 1:
+                diff_data = np.abs(np.diff(combined_phase_data))
+                diff_data = np.insert(diff_data, 0, 0)  # Add zero at beginning for same length
+            else:
+                diff_data = combined_phase_data
+                
+            # Create the plot using the existing create_single_plot method
+            # Use "diff" type to show movement and "Aggregated" as title
+            return self.create_single_plot(
+                diff_data, frame_idx, plot_width, plot_height, 
+                plot_type="diff", title="Aggregated", 
+                total_frames=total_frames, x_min=x_min, x_max=x_max
+            )
+        
+        except Exception as e:
+            print(f"Error creating aggregated movement plot: {str(e)}")
+            blank = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+            cv2.putText(blank, f"Error: {str(e)[:50]}", 
+                      (20, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return blank
 
 
 if __name__ == "__main__":
