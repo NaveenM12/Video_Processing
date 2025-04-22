@@ -7,7 +7,7 @@ Edit this file to change input/output paths and magnification parameters.
 INPUT_VIDEO_PATH = "/Users/naveenmirapuri/VideoProcessing/trimmed_mp4/1.mp4"
 # Alternative test path for a longer video (uncomment to use)
 # INPUT_VIDEO_PATH = "/Users/naveenmirapuri/VideoProcessing/test_videos/face_longer.mp4"
-OUTPUT_VIDEO_PATH = "output_videos/side_by_side_output.mp4"
+OUTPUT_VIDEO_PATH = "output_videos/side_by_side_output_1.mp4"
 KEEP_TEMP_FILES = False
 
 # Motion Magnification Parameters - Optimized for detecting micro-expressions
