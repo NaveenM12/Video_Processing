@@ -26,6 +26,7 @@ import mediapipe as mp
 from copy import deepcopy
 from config import *
 from upper_face_detector import UpperFaceDetector
+from cheek_detector import CheekDetector
 
 class SideBySideMagnification:
     def __init__(self, motion_params=None, color_params=None):
@@ -53,6 +54,9 @@ class SideBySideMagnification:
         
         # Initialize upper face detector for heart rate detection
         self.upper_face_detector = UpperFaceDetector()
+        
+        # Initialize cheek detector for improved heart rate detection
+        self.cheek_detector = CheekDetector()
         
         # Initialize face detection for micro-expression tracking
         # Use MediaPipe Face Mesh for more accurate landmark tracking
@@ -654,29 +658,35 @@ class SideBySideMagnification:
             if not frames or len(frames) < 2:
                 return np.zeros(len(frames) if frames else 0)
                 
-            # Extract the green channel which is most sensitive to blood flow
+            # Following the Berrios article approach for green channel analysis
             green_vals = []
+            
             for frame in frames:
-                # Extract green channel
+                # Extract green channel specifically as it's most sensitive to blood flow changes
                 green = frame[:, :, 1].astype(np.float32)
-                # Calculate mean green value
+                
+                # Calculate mean green value for this frame (spatial average)
                 green_vals.append(np.mean(green))
                 
             # Convert to numpy array
             signal_data = np.array(green_vals)
             
-            # Normalize signal
+            # Normalize signal by removing mean and scaling by standard deviation
             signal_data = signal_data - np.mean(signal_data)
             if np.std(signal_data) > 0:
                 signal_data = signal_data / np.std(signal_data)
                 
-            # Apply bandpass filter to focus on heart rate frequencies (0.7-4Hz)
-            # Assuming 30fps video
-            fps = 30
-            low_cutoff = 0.7 / (fps/2)  # ~42 BPM
-            high_cutoff = 4.0 / (fps/2)  # ~240 BPM
+            # Apply bandpass filter focusing specifically on the heart rate range we want (50-180 BPM)
+            fps = 30  # Assume standard video frame rate
+            if hasattr(self, 'fps') and self.fps > 0:
+                fps = self.fps
+                
+            # Convert heart rate ranges to frequencies normalized by Nyquist
+            # 50 BPM = 0.83 Hz, 180 BPM = 3.0 Hz
+            low_cutoff = (50/60) / (fps/2)  # ~50 BPM normalized
+            high_cutoff = (180/60) / (fps/2)  # ~180 BPM normalized
             
-            # Create butterworth bandpass filter
+            # Create bandpass filter optimized for heart rate detection
             b, a = signal.butter(2, [low_cutoff, high_cutoff], btype='band')
             filtered_signal = signal.filtfilt(b, a, signal_data)
             
@@ -734,51 +744,190 @@ class SideBySideMagnification:
             if np.std(combined_signal) > 0:
                 combined_signal = combined_signal / np.std(combined_signal)
             
-            # Calculate instantaneous heart rate using peaks
-            peaks, _ = signal.find_peaks(combined_signal, distance=7)  # Minimum distance between peaks
+            # Apply additional smoothing to reduce noise while preserving peaks
+            # This helps with more consistent peak detection
+            window_length = min(15, signal_length // 3 * 2 + 1)  # Must be odd
+            if window_length % 2 == 0:
+                window_length += 1
+            if window_length >= 5:  # Only smooth if we have enough data
+                combined_signal = signal.savgol_filter(combined_signal, window_length, 2)
             
-            # Calculate instantaneous BPM for each frame
-            inst_bpm = np.zeros(len(combined_signal))
+            # Calculate BPM using three approaches and combine results:
             
-            if len(peaks) >= 2:
-                # Calculate for each peak
-                for i in range(len(peaks)-1):
-                    # Calculate time between peaks in seconds
+            # 1. PEAK DETECTION APPROACH
+            # Use more robust peak detection with consistent parameters
+            # Focus on clear prominent peaks by using prominence
+            peak_distance = int(fps * 0.5)  # Minimum 0.5 seconds between peaks (120 BPM max)
+            prominence = max(0.2, np.max(np.abs(combined_signal)) * 0.3)  # Adaptive prominence
+            
+            peaks, properties = signal.find_peaks(
+                combined_signal,
+                distance=peak_distance,
+                prominence=prominence,
+                width=(None, int(fps * 0.4))  # Max width based on physiological limits
+            )
+            
+            # If not enough peaks found with strict criteria, try more relaxed approach
+            if len(peaks) < 3:
+                peaks, _ = signal.find_peaks(
+                    combined_signal,
+                    distance=int(fps * 0.4),
+                    height=np.max(combined_signal) * 0.3
+                )
+            
+            # Calculate instantaneous BPM from peaks (time domain approach)
+            inst_bpm_time = np.zeros(signal_length)
+            
+            if len(peaks) >= 3:  # Need at least 3 peaks for reasonable estimation
+                # Calculate average time between peaks
+                peak_intervals = np.diff(peaks)
+                avg_interval = np.mean(peak_intervals)
+                
+                # Convert to BPM
+                baseline_bpm = 60 * fps / avg_interval if avg_interval > 0 else 75
+                
+                # Fill in BPM for each section between peaks
+                for i in range(len(peaks) - 1):
+                    # Calculate time between these specific peaks in seconds
                     time_between_peaks = (peaks[i+1] - peaks[i]) / fps
+                    
                     # Convert to BPM
                     if time_between_peaks > 0:
                         curr_bpm = 60 / time_between_peaks
-                        # Only assign valid BPM values (between 40-240)
-                        if 40 <= curr_bpm <= 240:
+                        # Limit to physiological range (40-180 BPM)
+                        if 40 <= curr_bpm <= 180:
                             # Assign to all frames between these peaks
                             start_idx = peaks[i]
                             end_idx = peaks[i+1]
-                            inst_bpm[start_idx:end_idx] = curr_bpm
+                            inst_bpm_time[start_idx:end_idx] = curr_bpm
+                        else:
+                            # Use baseline if outside physiological range
+                            start_idx = peaks[i]
+                            end_idx = peaks[i+1]
+                            inst_bpm_time[start_idx:end_idx] = baseline_bpm
                 
                 # Fill in any remaining frames at the end
-                if peaks[-1] < len(inst_bpm):
-                    inst_bpm[peaks[-1]:] = inst_bpm[peaks[-1]-1] if peaks[-1] > 0 else 0
-                    
+                if peaks[-1] < signal_length:
+                    if len(peaks) >= 2:
+                        # Use the last valid interval for remaining frames
+                        last_interval = peaks[-1] - peaks[-2]
+                        last_bpm = 60 * fps / last_interval if last_interval > 0 else baseline_bpm
+                        inst_bpm_time[peaks[-1]:] = last_bpm
+                    else:
+                        inst_bpm_time[peaks[-1]:] = baseline_bpm
+                
                 # Fill in any blank frames at the beginning
-                if peaks[0] > 0 and len(peaks) > 1 and peaks[1] < len(inst_bpm) and inst_bpm[peaks[1]] > 0:
-                    inst_bpm[:peaks[0]] = inst_bpm[peaks[1]]
+                if peaks[0] > 0:
+                    if len(peaks) >= 2:
+                        # Use the first valid interval for beginning frames
+                        first_interval = peaks[1] - peaks[0]
+                        first_bpm = 60 * fps / first_interval if first_interval > 0 else baseline_bpm
+                        inst_bpm_time[:peaks[0]] = first_bpm
+                    else:
+                        inst_bpm_time[:peaks[0]] = baseline_bpm
+                
+                # Replace any remaining zeros with the baseline BPM
+                inst_bpm_time[inst_bpm_time == 0] = baseline_bpm
+            else:
+                # Not enough peaks - use frequency domain as fallback
+                inst_bpm_time = np.ones(signal_length) * 75  # Default value
             
-            # Calculate windowed average BPM (smoother signal)
+            # 2. FREQUENCY DOMAIN APPROACH
+            # Use FFT to find dominant frequency in the whole signal
+            # This is more stable for overall BPM but doesn't show variations
+            if signal_length > fps:  # Need at least 1 second of data
+                # Calculate FFT
+                fft_values = np.abs(np.fft.rfft(combined_signal))
+                frequencies = np.fft.rfftfreq(len(combined_signal), d=1.0/fps)
+                
+                # Limit to physiological heart rate range (40-180 BPM)
+                valid_range = (frequencies >= 40/60) & (frequencies <= 180/60)
+                if np.any(valid_range):
+                    valid_freqs = frequencies[valid_range]
+                    valid_fft = fft_values[valid_range]
+                    
+                    # Find the peak frequency in the valid range
+                    if len(valid_fft) > 0:
+                        peak_idx = np.argmax(valid_fft)
+                        peak_freq = valid_freqs[peak_idx]
+                        
+                        # Convert frequency to BPM
+                        global_bpm = peak_freq * 60
+                        
+                        # Assign to all frames as base estimate
+                        inst_bpm_freq = np.ones(signal_length) * global_bpm
+                    else:
+                        inst_bpm_freq = np.ones(signal_length) * 75  # Default
+                else:
+                    inst_bpm_freq = np.ones(signal_length) * 75  # Default
+            else:
+                inst_bpm_freq = np.ones(signal_length) * 75  # Default
+            
+            # 3. WINDOWED FREQUENCY APPROACH
+            # Calculate BPM in sliding windows to capture variations
+            # while maintaining stability
+            inst_bpm_windowed = np.zeros(signal_length)
+            window_size = int(fps * 4)  # 4-second windows for analysis
+            
+            if signal_length > window_size:
+                for i in range(0, signal_length - window_size, window_size // 4):  # 75% overlap
+                    end_idx = min(i + window_size, signal_length)
+                    window_signal = combined_signal[i:end_idx]
+                    
+                    # Calculate FFT for this window
+                    window_fft = np.abs(np.fft.rfft(window_signal))
+                    window_freqs = np.fft.rfftfreq(len(window_signal), d=1.0/fps)
+                    
+                    # Find dominant frequency in heart rate range
+                    valid_range = (window_freqs >= 40/60) & (window_freqs <= 180/60)
+                    if np.any(valid_range):
+                        valid_freqs = window_freqs[valid_range]
+                        valid_fft = window_fft[valid_range]
+                        
+                        if len(valid_fft) > 0 and np.max(valid_fft) > 0:
+                            peak_idx = np.argmax(valid_fft)
+                            window_bpm = valid_freqs[peak_idx] * 60
+                            
+                            # Assign to all frames in this window
+                            inst_bpm_windowed[i:end_idx] = window_bpm
+            
+            # Fill any remaining zeros with frequency-based BPM
+            inst_bpm_windowed[inst_bpm_windowed == 0] = inst_bpm_freq[inst_bpm_windowed == 0]
+            
+            # COMBINE THE APPROACHES:
+            # - Use time-domain (peaks) for instantaneous values with weight of 0.4
+            # - Use windowed frequency for medium-term stability with weight of 0.4
+            # - Use global frequency for overall stability with weight of 0.2
+            inst_bpm = (inst_bpm_time * 0.4) + (inst_bpm_windowed * 0.4) + (inst_bpm_freq * 0.2)
+            
+            # Ensure values are in physiological range
+            inst_bpm = np.clip(inst_bpm, 40, 180)
+            
+            # Calculate final smoothed BPM using a larger window for display
+            # This provides a more stable readout while still capturing trends
             avg_bpm = np.zeros_like(inst_bpm)
-            window_len = int(fps * 3)  # 3-second window
+            window_len = int(fps * 5)  # 5-second window (increased from 3)
             
             for i in range(len(inst_bpm)):
                 start_idx = max(0, i - window_len//2)
                 end_idx = min(len(inst_bpm), i + window_len//2)
                 values = inst_bpm[start_idx:end_idx]
-                values = values[values > 0]  # Only consider non-zero values
-                if len(values) > 0:
-                    avg_bpm[i] = np.mean(values)
-                
+                avg_bpm[i] = np.mean(values)
+            
+            # Apply final smoothing to avoid jerky transitions
+            # Use Savitzky-Golay filter for smooth curve that follows trends
+            if len(avg_bpm) > window_len:
+                window_size = min(window_len, len(avg_bpm) // 2)
+                if window_size % 2 == 0:
+                    window_size += 1  # Must be odd
+                avg_bpm = signal.savgol_filter(avg_bpm, window_size, 2)
+            
             return inst_bpm, avg_bpm, combined_signal
             
         except Exception as e:
             print(f"Error in calculate_bpm: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def create_heart_rate_plot(self, bpm_data, frame_idx, plot_width, plot_height, x_min=None, x_max=None):
@@ -920,16 +1069,15 @@ class SideBySideMagnification:
             return blank
     
     def create_pulse_signal_plot(self, bpm_data, frame_idx, plot_width, plot_height, x_min=None, x_max=None):
-        """Creates a plot showing the blood volume pulse signal"""
+        """Creates a plot showing the blood volume pulse signal with peaks and BPM labels"""
         try:
             # Create figure with improved aspect ratio - wider for better horizontal stretching
-            # Use a fixed figure size that scales well regardless of data length
             fig = plt.figure(figsize=(10, 6), dpi=100, facecolor='white')
             ax = fig.add_subplot(1, 1, 1)
             plt.subplots_adjust(left=0.12, right=0.88, top=0.85, bottom=0.15)
             
             # Extract data
-            _, _, combined_signal = bpm_data
+            inst_bpm, avg_bpm, combined_signal = bpm_data
             
             # Get max length
             max_len = len(combined_signal)
@@ -938,21 +1086,81 @@ class SideBySideMagnification:
             x = np.arange(max_len)
             
             # Plot signal
-            ax.plot(x, combined_signal, '-', color='green', linewidth=1.5)
+            ax.plot(x, combined_signal, '-', color='green', linewidth=2.0, label='Blood Volume Pulse')
             
-            # Add current frame indicator with proper scaling
+            # Detect peaks for visualization
+            # Use same parameters as in BPM calculation for consistency
+            min_distance = int(self.fps * 0.5) if hasattr(self, 'fps') else 15
+            prominence = max(0.2, np.max(np.abs(combined_signal)) * 0.3)  # Adaptive prominence
+            
+            peaks, properties = signal.find_peaks(
+                combined_signal, 
+                distance=min_distance,
+                prominence=prominence
+            )
+            
+            # Highlight peaks with red markers
+            if len(peaks) > 0:
+                ax.plot(peaks, combined_signal[peaks], 'ro', markersize=8, 
+                      markeredgecolor='darkred', markeredgewidth=1.5, 
+                      alpha=0.9, label='Detected Heartbeats')
+                
+                # Add BPM values for peak intervals
+                if len(peaks) >= 2:
+                    for i in range(len(peaks)-1):
+                        # Only add labels for every other peak to avoid crowding
+                        if i % 2 == 0:
+                            # Calculate time between peaks in seconds
+                            time_between = (peaks[i+1] - peaks[i]) / self.fps if hasattr(self, 'fps') else (peaks[i+1] - peaks[i]) / 30
+                            
+                            # Calculate BPM for this interval
+                            if time_between > 0:
+                                interval_bpm = 60 / time_between
+                                
+                                # Skip if outside reasonable range
+                                if 40 <= interval_bpm <= 180:
+                                    # Position the label between peaks, slightly above the signal
+                                    mid_pos = (peaks[i] + peaks[i+1]) // 2
+                                    y_pos = combined_signal[mid_pos] if mid_pos < len(combined_signal) else 0
+                                    y_offset = np.max(combined_signal) * 0.2  # Position label above signal
+                                    
+                                    # Add label with actual BPM for this interval
+                                    ax.text(mid_pos, y_pos + y_offset, f"{interval_bpm:.0f} BPM", 
+                                          fontsize=8, color='darkred', alpha=0.8,
+                                          ha='center', va='bottom',
+                                          bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+            
+            # Add current frame indicator
             if frame_idx > 0 and frame_idx < max_len:
                 # Scale frame_idx if necessary to fit within the data length
                 scaled_frame_idx = min(frame_idx, max_len-1)
                 
-                ax.axvline(x=scaled_frame_idx, color='green', linestyle='--', alpha=0.7)
+                ax.axvline(x=scaled_frame_idx, color='green', linestyle='--', alpha=0.7, label='Current Frame')
                 ax.plot(scaled_frame_idx, combined_signal[scaled_frame_idx], 'o', color='lime', markersize=10, 
                       markeredgecolor='black', markeredgewidth=1.5, zorder=10)
+                
+                # Show current BPM at this frame
+                if frame_idx < len(avg_bpm):
+                    current_bpm = avg_bpm[frame_idx]
+                    ax.text(scaled_frame_idx + 10, combined_signal[scaled_frame_idx], 
+                          f"Current: {current_bpm:.1f} BPM", 
+                          fontsize=10, fontweight='bold',
+                          bbox=dict(facecolor='white', alpha=0.8, edgecolor='lightgray', boxstyle='round'))
             
             # Set signal plot properties with increased font sizes
-            ax.set_title("Blood Volume Pulse Signal", fontsize=20, fontweight='bold')
-            ax.set_xlabel("Frame Number", fontsize=14)
-            ax.set_ylabel("Amplitude", fontsize=14)
+            ax.set_title("Blood Volume Pulse Signal", fontsize=18, fontweight='bold')
+            ax.set_xlabel("Frame Number", fontsize=12)
+            ax.set_ylabel("Amplitude", fontsize=12)
+            
+            # Add a textual explanation of what the plot shows
+            explanation_text = "Each peak represents a heartbeat\nIntervals between peaks determine BPM"
+            ax.text(0.02, 0.97, explanation_text, 
+                  transform=ax.transAxes, fontsize=10,
+                  verticalalignment='top', horizontalalignment='left',
+                  bbox=dict(facecolor='white', alpha=0.7, edgecolor='lightgray', boxstyle='round,pad=0.5'))
+            
+            # Show legend
+            ax.legend(loc='lower right', fontsize=9)
             
             # Use consistent x-axis limits if provided
             # For pulse signal, we might need to scale the global limits to match the data length
@@ -1006,7 +1214,7 @@ class SideBySideMagnification:
             ax.grid(True, linestyle='--', alpha=0.7)
             
             # Increase tick font size
-            ax.tick_params(axis='both', which='major', labelsize=12)
+            ax.tick_params(axis='both', which='major', labelsize=10)
             
             plt.tight_layout()
             
@@ -1057,6 +1265,8 @@ class SideBySideMagnification:
             
         except Exception as e:
             print(f"Error creating pulse signal plot for frame {frame_idx}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             blank = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
             cv2.putText(blank, f"Error: {str(e)[:50]}", 
                       (20, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -1415,13 +1625,14 @@ class SideBySideMagnification:
         out.release()
         print("Motion magnification complete!")
     
-    def process_color_magnification(self, frames: List[np.ndarray], fps: float = 30.0, alpha_blend: float = 0.5) -> List[np.ndarray]:
-        """Apply color magnification to the entire face region above the mouth for heart rate detection.
+    def process_color_magnification(self, frames: List[np.ndarray], fps: float = 30.0, alpha_blend: float = 0.25) -> List[np.ndarray]:
+        """Apply color magnification to the cheek regions for heart rate detection.
         
         Args:
             frames: List of input frames
             fps: Frames per second of the video
             alpha_blend: Blend factor for color magnification (0.0-1.0)
+                         Set to 0.25 for visible but natural color changes
             
         Returns:
             List of color-magnified frames
@@ -1429,38 +1640,64 @@ class SideBySideMagnification:
         if not frames:
             return []
         
-        # Use our upper face detector to get the face region above the mouth
-        detected, face_regions = self.upper_face_detector.detect_upper_face(frames[0])
-        if not detected:
+        # Use the cheek detector to get left and right cheek regions
+        detected, face_regions = self.cheek_detector.detect_cheeks(frames[0])
+        if not detected or not face_regions:
             print("No face detected for color magnification")
             return frames.copy()
         
-        # Get upper face region
-        face_region = face_regions[0]['regions']['upper_face']
-        x_min, y_min, x_max, y_max = face_region['bounds']
-        
         # Create debug visualization
         debug_frame = frames[0].copy()
-        debug_frame = self.upper_face_detector.draw_upper_face_region(debug_frame, face_regions[0])
+        debug_frame = self.cheek_detector.draw_cheek_regions(debug_frame, face_regions)
+        os.makedirs("Separate_Color_Motion_Magnification/output_videos", exist_ok=True)
         cv2.imwrite("Separate_Color_Motion_Magnification/output_videos/heart_rate_region_debug.jpg", debug_frame)
         
-        # Extract upper face regions from all frames
-        upper_face_frames = []
+        # Extract cheek regions from first detected face
+        face_region = face_regions[0]
+        regions = face_region['regions']
+        
+        left_cheek_frames = []
+        right_cheek_frames = []
+        left_cheek_info = None
+        right_cheek_info = None
+        
+        # Process all frames to extract cheek regions
         for frame in frames:
-            upper_face = frame[y_min:y_max, x_min:x_max].copy()
-            upper_face_frames.append(upper_face)
+            # Get cheeks for this frame
+            detected, curr_face_regions = self.cheek_detector.detect_cheeks(frame)
+            
+            if detected and curr_face_regions:
+                curr_regions = curr_face_regions[0]['regions']
+                
+                # Extract left cheek if available
+                if 'left_cheek' in curr_regions:
+                    left_cheek_frames.append(curr_regions['left_cheek']['image'])
+                    if left_cheek_info is None:
+                        left_cheek_info = curr_regions['left_cheek']
+                        
+                # Extract right cheek if available
+                if 'right_cheek' in curr_regions:
+                    right_cheek_frames.append(curr_regions['right_cheek']['image'])
+                    if right_cheek_info is None:
+                        right_cheek_info = curr_regions['right_cheek']
         
-        # Apply color magnification to the upper face regions
-        print(f"Processing upper face region for heart rate detection ({len(upper_face_frames)} frames at {fps} fps)")
-        
-        # Set magnification parameters from config - following the article's recommendations
+        # Set magnification parameters from config
         self.color_processor.alpha = COLOR_MAG_PARAMS['alpha']
         self.color_processor.level = COLOR_MAG_PARAMS['level']
         self.color_processor.f_lo = COLOR_MAG_PARAMS['f_lo']
         self.color_processor.f_hi = COLOR_MAG_PARAMS['f_hi']
         
-        # Apply magnification to face region using ColorMagnification directly
-        magnified_regions = self.color_processor.magnify(upper_face_frames)
+        # Apply magnification to each cheek region if we have enough frames
+        magnified_left_cheek = None
+        magnified_right_cheek = None
+        
+        if len(left_cheek_frames) > 10:
+            print(f"Processing left cheek region for heart rate detection ({len(left_cheek_frames)} frames)")
+            magnified_left_cheek = self.color_processor.magnify(left_cheek_frames)
+        
+        if len(right_cheek_frames) > 10:
+            print(f"Processing right cheek region for heart rate detection ({len(right_cheek_frames)} frames)")
+            magnified_right_cheek = self.color_processor.magnify(right_cheek_frames)
         
         # Create output frames by reintegrating the magnified regions
         magnified_frames = []
@@ -1468,42 +1705,143 @@ class SideBySideMagnification:
             # Create a copy of the original frame
             magnified = frame.copy()
             
-            # Check if we have a valid magnified region
-            if i < len(magnified_regions):
-                # Get the original region
-                original_region = magnified[y_min:y_max, x_min:x_max]
+            # Apply left cheek magnification if available
+            if magnified_left_cheek and i < len(magnified_left_cheek) and left_cheek_info:
+                bounds = left_cheek_info['bounds']
+                x_min, y_min, x_max, y_max = bounds
                 
                 # Get the magnified region
-                magnified_region = magnified_regions[i]
+                magnified_region = magnified_left_cheek[i].copy()  # Always work with a copy
                 
-                # Ensure both have the same shape
-                if magnified_region.shape[:2] == original_region.shape[:2]:
-                    # Use a lower alpha for blending to avoid color artifacts
-                    # The article suggests not overamplifying to avoid unwanted artifacts
-                    blend_factor = min(alpha_blend, 0.5)
-                    
-                    # Blend the original and magnified regions instead of direct replacement
-                    blended_region = cv2.addWeighted(
-                        magnified_region, blend_factor,
-                        original_region, 1.0 - blend_factor,
-                        0
-                    )
-                    
-                    # Replace the region in the output frame
-                    magnified[y_min:y_max, x_min:x_max] = blended_region
-                else:
-                    # Resize if needed (shouldn't happen but just in case)
-                    resized_magnified = cv2.resize(magnified_region, (original_region.shape[1], original_region.shape[0]))
-                    blend_factor = min(alpha_blend, 0.5)
-                    blended_region = cv2.addWeighted(
-                        resized_magnified, blend_factor,
-                        original_region, 1.0 - blend_factor,
-                        0
-                    )
-                    magnified[y_min:y_max, x_min:x_max] = blended_region
-                    print(f"Resized region for frame {i} due to shape mismatch.")
-            else:
-                print(f"Warning: No magnified region for frame {i}. Skipping magnification.")
+                # Ensure the region has the correct size
+                if magnified_region.shape[:2] != (y_max - y_min, x_max - x_min):
+                    magnified_region = cv2.resize(magnified_region, (x_max - x_min, y_max - y_min))
+                
+                original_region = magnified[y_min:y_max, x_min:x_max].copy()
+                
+                # Convert to LAB color space which better separates luminance from color
+                # This helps preserve skin texture while only magnifying color
+                magnified_lab = cv2.cvtColor(magnified_region, cv2.COLOR_BGR2LAB)
+                original_lab = cv2.cvtColor(original_region, cv2.COLOR_BGR2LAB)
+                
+                # Keep the L channel (luminance) from original but use a/b channels from magnified
+                # This preserves skin texture while only changing color
+                magnified_lab[:,:,0] = original_lab[:,:,0]
+                
+                # Apply clipping to a/b channels to prevent extreme color values
+                # Values typically range from 0-255, with 128 being neutral
+                for c in range(1, 3):
+                    # Get the mean of the original color to use as reference
+                    orig_mean = np.mean(original_lab[:,:,c])
+                    # Limit how far the magnified color can deviate from the original mean
+                    max_deviation = 20  # Maximum allowed deviation from original color
+                    upper_limit = min(255, orig_mean + max_deviation)
+                    lower_limit = max(0, orig_mean - max_deviation)
+                    magnified_lab[:,:,c] = np.clip(magnified_lab[:,:,c], lower_limit, upper_limit)
+                
+                # Convert back to BGR
+                enhanced_region = cv2.cvtColor(magnified_lab, cv2.COLOR_LAB2BGR)
+                
+                # Apply light Gaussian blur to reduce any remaining artifacts or pixelation
+                enhanced_region = cv2.GaussianBlur(enhanced_region, (3, 3), 0.5)
+                
+                # Apply addWeighted for subtle blending with the original
+                blended_region = cv2.addWeighted(
+                    enhanced_region, alpha_blend, 
+                    original_region, 1.0 - alpha_blend,
+                    0
+                )
+                
+                # Final check to remove any extreme values (like black patches or bright spots)
+                # Convert to HSV to easily check brightness (V channel)
+                blended_hsv = cv2.cvtColor(blended_region, cv2.COLOR_BGR2HSV)
+                original_hsv = cv2.cvtColor(original_region, cv2.COLOR_BGR2HSV)
+                
+                # If any pixel is too dark or too bright compared to original, replace it
+                orig_v = original_hsv[:,:,2].astype(np.float32)
+                blend_v = blended_hsv[:,:,2].astype(np.float32)
+                
+                # Create a mask where values are too different from original
+                too_dark = blend_v < (orig_v * 0.7)  # 30% darker than original
+                too_bright = blend_v > (orig_v * 1.3)  # 30% brighter than original
+                problem_mask = too_dark | too_bright
+                
+                # Where problems exist, replace with original
+                if np.any(problem_mask):
+                    for c in range(3):
+                        blended_region[:,:,c][problem_mask] = original_region[:,:,c][problem_mask]
+                
+                # Replace the region in the output frame
+                magnified[y_min:y_max, x_min:x_max] = blended_region
+            
+            # Apply right cheek magnification if available
+            if magnified_right_cheek and i < len(magnified_right_cheek) and right_cheek_info:
+                bounds = right_cheek_info['bounds']
+                x_min, y_min, x_max, y_max = bounds
+                
+                # Get the magnified region
+                magnified_region = magnified_right_cheek[i].copy()  # Always work with a copy
+                
+                # Ensure the region has the correct size
+                if magnified_region.shape[:2] != (y_max - y_min, x_max - x_min):
+                    magnified_region = cv2.resize(magnified_region, (x_max - x_min, y_max - y_min))
+                
+                original_region = magnified[y_min:y_max, x_min:x_max].copy()
+                
+                # Convert to LAB color space which better separates luminance from color
+                # This helps preserve skin texture while only magnifying color
+                magnified_lab = cv2.cvtColor(magnified_region, cv2.COLOR_BGR2LAB)
+                original_lab = cv2.cvtColor(original_region, cv2.COLOR_BGR2LAB)
+                
+                # Keep the L channel (luminance) from original but use a/b channels from magnified
+                # This preserves skin texture while only changing color
+                magnified_lab[:,:,0] = original_lab[:,:,0]
+                
+                # Apply clipping to a/b channels to prevent extreme color values
+                # Values typically range from 0-255, with 128 being neutral
+                for c in range(1, 3):
+                    # Get the mean of the original color to use as reference
+                    orig_mean = np.mean(original_lab[:,:,c])
+                    # Limit how far the magnified color can deviate from the original mean
+                    max_deviation = 20  # Maximum allowed deviation from original color
+                    upper_limit = min(255, orig_mean + max_deviation)
+                    lower_limit = max(0, orig_mean - max_deviation)
+                    magnified_lab[:,:,c] = np.clip(magnified_lab[:,:,c], lower_limit, upper_limit)
+                
+                # Convert back to BGR
+                enhanced_region = cv2.cvtColor(magnified_lab, cv2.COLOR_LAB2BGR)
+                
+                # Apply light Gaussian blur to reduce any remaining artifacts or pixelation
+                enhanced_region = cv2.GaussianBlur(enhanced_region, (3, 3), 0.5)
+                
+                # Apply addWeighted for subtle blending with the original
+                blended_region = cv2.addWeighted(
+                    enhanced_region, alpha_blend, 
+                    original_region, 1.0 - alpha_blend,
+                    0
+                )
+                
+                # Final check to remove any extreme values (like black patches or bright spots)
+                # Convert to HSV to easily check brightness (V channel)
+                blended_hsv = cv2.cvtColor(blended_region, cv2.COLOR_BGR2HSV)
+                original_hsv = cv2.cvtColor(original_region, cv2.COLOR_BGR2HSV)
+                
+                # If any pixel is too dark or too bright compared to original, replace it
+                orig_v = original_hsv[:,:,2].astype(np.float32)
+                blend_v = blended_hsv[:,:,2].astype(np.float32)
+                
+                # Create a mask where values are too different from original
+                too_dark = blend_v < (orig_v * 0.7)  # 30% darker than original
+                too_bright = blend_v > (orig_v * 1.3)  # 30% brighter than original
+                problem_mask = too_dark | too_bright
+                
+                # Where problems exist, replace with original
+                if np.any(problem_mask):
+                    for c in range(3):
+                        blended_region[:,:,c][problem_mask] = original_region[:,:,c][problem_mask]
+                
+                # Replace the region in the output frame
+                magnified[y_min:y_max, x_min:x_max] = blended_region
             
             magnified_frames.append(magnified)
         
@@ -1658,30 +1996,37 @@ class SideBySideMagnification:
         # Calculate color changes and heart rate
         print("Processing color changes for heart rate detection...")
         
-        # Detect upper face region for heart rate analysis
-        face_regions = self.upper_face_detector.detect_upper_face(all_frames[0])
+        # Detect cheek regions for heart rate analysis
+        detected, cheek_regions = self.cheek_detector.detect_cheeks(all_frames[0])
         
-        if face_regions and len(face_regions) > 0:
-            upper_face_frames = []
+        if detected and cheek_regions:
+            left_cheek_frames = []
+            right_cheek_frames = []
             
             for frame in all_frames:
-                detected, regions = self.upper_face_detector.detect_upper_face(frame)
-                if detected and 'upper_face' in regions[0]['regions']:
-                    region = regions[0]['regions']['upper_face']
-                    upper_face_frames.append(region['image'])
+                detected, regions = self.cheek_detector.detect_cheeks(frame)
+                if detected and regions and 'regions' in regions[0]:
+                    if 'left_cheek' in regions[0]['regions']:
+                        left_cheek_frames.append(regions[0]['regions']['left_cheek']['image'])
+                    if 'right_cheek' in regions[0]['regions']:
+                        right_cheek_frames.append(regions[0]['regions']['right_cheek']['image'])
             
-            # Calculate color changes for upper face region
-            if upper_face_frames:
-                print(f"Calculating color changes for {len(upper_face_frames)} upper face frames")
-                upper_face_changes = self.calculate_color_changes(upper_face_frames)
-                all_color_changes['face1_upper_face'] = upper_face_changes
-                
-                # Calculate BPM from color signals - adjust fps for 0.5x speed
-                # Since we're halving the playback rate, to keep BPM calculation consistent 
-                # we need to use the original fps for physiological accuracy
-                bpm_data = self.calculate_bpm(all_color_changes, fps)  
+            # Calculate color changes for each cheek
+            if left_cheek_frames:
+                print(f"Calculating color changes for {len(left_cheek_frames)} left cheek frames")
+                left_cheek_changes = self.calculate_color_changes(left_cheek_frames)
+                all_color_changes['face1_left_cheek'] = left_cheek_changes
+            
+            if right_cheek_frames:
+                print(f"Calculating color changes for {len(right_cheek_frames)} right cheek frames")
+                right_cheek_changes = self.calculate_color_changes(right_cheek_frames)
+                all_color_changes['face1_right_cheek'] = right_cheek_changes
+            
+            # Calculate BPM from color signals
+            if all_color_changes:
+                bpm_data = self.calculate_bpm(all_color_changes, fps)
             else:
-                print("No upper face frames detected for color analysis")
+                print("No color changes detected for BPM calculation")
                 bpm_data = None
         else:
             print("No face detected for heart rate analysis")
@@ -1977,7 +2322,8 @@ class SideBySideMagnification:
                     if pulse_y_end <= combined_height:  # Make sure it's not out of bounds
                         combined_frame[pulse_y_start:pulse_y_end, pulse_x_start:pulse_x_end, :] = pulse_signal_plot
                         
-                    # Replace info panel with aggregated movement plot (third row, third column)
+                    # Add aggregated movement plot from phase changes only (third row, third column)
+                    # This plot shows the combined motion from all phase-based magnification regions
                     agg_movement_plot = self.create_aggregated_movement_plot(
                         all_phase_changes, current_frame_position, plot_width, plot_height, 
                         total_frames=total_video_frames, x_min=global_frame_min, x_max=global_frame_max
@@ -2159,53 +2505,45 @@ class SideBySideMagnification:
             Aggregated movement plot as numpy array
         """
         try:
-            # Collect all phase changes from eyes and nose regions
+            # IMPORTANT: Only include specified motion regions (left_eye, right_eye, nose_tip)
+            # This ensures the aggregated plot is not affected by changes to color magnification
+            motion_regions = ['face1_left_eye', 'face1_right_eye', 'face1_nose_tip']
+            
+            # Collect all phase changes from the specified motion regions only
             combined_phase_data = None
-            region_weights = {'left_eye': 1.0, 'right_eye': 1.0, 'nose_tip': 1.0, 'nose': 1.0}
             region_count = 0
             
-            # For each region, look for matching keys in the all_phase_changes dictionary
-            for region_key, phase_data in all_phase_changes.items():
-                # Skip empty data
-                if len(phase_data) == 0:
-                    continue
+            # Process only the specified motion regions with equal weighting
+            for region_key in motion_regions:
+                # Check if this region exists in our data
+                if region_key in all_phase_changes:
+                    phase_data = all_phase_changes[region_key]
                     
-                # Skip mouth regions
-                if 'mouth' in region_key.lower():
-                    continue
+                    # Skip empty data
+                    if len(phase_data) == 0:
+                        continue
                     
-                # Find which region type this matches
-                region_type = None
-                for key in region_weights.keys():
-                    if key in region_key.lower():
-                        region_type = key
-                        break
-                
-                # Skip if no matching region type found
-                if region_type is None:
-                    continue
-                    
-                # Add to combined data if this is the first region of its type
-                if combined_phase_data is None:
-                    # Initialize with first data array
-                    combined_phase_data = np.array(phase_data) * region_weights[region_type]
-                    region_count += 1
-                else:
-                    # Ensure arrays are the same length by padding the shorter one
-                    if len(phase_data) < len(combined_phase_data):
-                        # Pad phase_data with zeros
-                        padded_data = np.pad(phase_data, (0, len(combined_phase_data) - len(phase_data)), 'constant')
-                        combined_phase_data += padded_data * region_weights[region_type]
-                        region_count += 1
-                    elif len(phase_data) > len(combined_phase_data):
-                        # Pad combined_phase_data with zeros
-                        combined_phase_data = np.pad(combined_phase_data, (0, len(phase_data) - len(combined_phase_data)), 'constant')
-                        combined_phase_data += np.array(phase_data) * region_weights[region_type]
+                    # Add to combined data with equal weighting
+                    if combined_phase_data is None:
+                        # Initialize with first data array
+                        combined_phase_data = np.array(phase_data)
                         region_count += 1
                     else:
-                        # Same length, just add weighted values
-                        combined_phase_data += np.array(phase_data) * region_weights[region_type]
-                        region_count += 1
+                        # Ensure arrays are the same length by padding the shorter one
+                        if len(phase_data) < len(combined_phase_data):
+                            # Pad phase_data with zeros
+                            padded_data = np.pad(phase_data, (0, len(combined_phase_data) - len(phase_data)), 'constant')
+                            combined_phase_data += padded_data
+                            region_count += 1
+                        elif len(phase_data) > len(combined_phase_data):
+                            # Pad combined_phase_data with zeros
+                            combined_phase_data = np.pad(combined_phase_data, (0, len(phase_data) - len(combined_phase_data)), 'constant')
+                            combined_phase_data += np.array(phase_data)
+                            region_count += 1
+                        else:
+                            # Same length, just add values with equal weight
+                            combined_phase_data += np.array(phase_data)
+                            region_count += 1
             
             # If we don't have any data, return a blank plot
             if combined_phase_data is None or len(combined_phase_data) == 0:
@@ -2234,7 +2572,7 @@ class SideBySideMagnification:
             # Use "diff" type to show movement and "Aggregated" as title
             return self.create_single_plot(
                 diff_data, frame_idx, plot_width, plot_height, 
-                plot_type="diff", title="Aggregated", 
+                plot_type="diff", title="Motion Magnification", 
                 total_frames=total_frames, x_min=x_min, x_max=x_max
             )
         

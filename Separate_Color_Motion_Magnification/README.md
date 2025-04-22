@@ -72,6 +72,34 @@ The output video is a horizontal concatenation of three videos:
 
 1. Left side: Original video labeled "Original"
 2. Middle: Motion-magnified video labeled "Motion Magnified" (optimized for micro-expressions)
-3. Right side: Color-magnified video labeled "Color Magnified (Heart Rate)" (optimized for heart rate detection)
+3. Right side: Color-magnified video labeled "Color Magnified" (optimized for heart rate detection)
 
 All three videos maintain their original aspect ratio, and labels are added with semi-transparent backgrounds for better visibility.
+
+## Heart Rate Detection
+
+The color magnification component has been updated to use the cheek regions instead of the upper face region for heart rate detection. This follows the approach outlined in ["How to detect Heart Rate in Videos" by Isaac Berrios](https://medium.com/@itberrios6/how-to-detect-heart-rate-in-videos-3dbbf1eb62fd).
+
+### Why Cheeks?
+
+Cheeks are ideal for heart rate detection because:
+
+1. They have good blood perfusion due to facial arteries
+2. They have less movement compared to other facial regions
+3. They are less affected by expressions than forehead or lips
+4. They have thinner skin allowing better visibility of blood volume changes
+
+The system now:
+
+- Detects left and right cheek regions using MediaPipe Face Mesh
+- Applies color magnification to enhance subtle color changes in the cheeks
+- Combines signals from both cheeks for improved heart rate estimation
+- Visualizes both the magnified video and the pulse signal
+
+## Dependencies
+
+- OpenCV
+- NumPy
+- Matplotlib
+- MediaPipe
+- SciPy

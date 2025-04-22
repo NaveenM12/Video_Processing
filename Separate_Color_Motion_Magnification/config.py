@@ -19,14 +19,15 @@ MOTION_MAG_PARAMS = {
     'attenuate': True        # Attenuate other frequencies to focus on the band of interest
 }
 
-# Color Magnification Parameters - Optimized for heart rate detection based on article
+# Color Magnification Parameters - Optimized for heart rate detection in 50-180 BPM range
 COLOR_MAG_PARAMS = {
-    'alpha': 50.0,           # Standard magnification factor as per the article
-    'level': 4,              # Pyramid level 4-6 recommended in the article
+    'alpha': 40.0,           # Reduced alpha to minimize artifacts while preserving color changes
+    'level': 5,              # Mid-pyramid level for optimal detail/noise balance
     
-    # Heart rate frequencies - focusing on 50-60 BPM as mentioned in the article
+    # Heart rate frequencies - standard resting to active heart rate range
     'f_lo': 50/60,           # 0.83 Hz - Lower boundary (~50 BPM)
-    'f_hi': 60/60,           # 1.0 Hz - Upper boundary (~60 BPM)
+    'f_hi': 180/60,          # 3.0 Hz - Upper boundary (~180 BPM)
+    'chromAttenuation': 0.0, # No attenuation to maintain full signal for analysis
 }
 
 # Display Parameters
