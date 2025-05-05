@@ -12,7 +12,7 @@ KEEP_TEMP_FILES = False
 
 # Motion Magnification Parameters - Optimized for detecting micro-expressions
 MOTION_MAG_PARAMS = {
-    'phase_mag': 25.0,       # Higher magnification factor for subtle movements
+    'phase_mag': 25.0,  # Original value - preserving magnification parameters
     'f_lo': 0.4,             # Higher low cutoff to filter out normal speech movements
     'f_hi': 1.2,             # Higher high cutoff to capture quick micro-expressions
     'sigma': 3.0,            # Increased sigma for better amplitude-weighted blurring

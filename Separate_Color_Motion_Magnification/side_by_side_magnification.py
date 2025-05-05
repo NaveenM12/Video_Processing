@@ -177,6 +177,24 @@ class SideBySideMagnification:
         motion_labeled = self.add_label(motion_copy, MOTION_LABEL)
         color_labeled = self.add_label(color_copy, COLOR_LABEL)
         
+        # Debug check - verify the frames are different
+        if np.array_equal(original_labeled, motion_labeled):
+            print("WARNING: Original and motion frames are identical after labeling!")
+            # Calculate difference to verify
+            diff = cv2.absdiff(original_copy, motion_copy)
+            mean_diff = np.mean(diff)
+            print(f"Mean difference between original and motion: {mean_diff}")
+            
+            # If almost identical, add a visual marker to motion frame for debugging
+            if mean_diff < 1.0:
+                # Add a red border to the motion frame for debugging
+                border_size = 5
+                motion_labeled[0:border_size, :, :] = [0, 0, 255]  # Top border
+                motion_labeled[-border_size:, :, :] = [0, 0, 255]  # Bottom border
+                motion_labeled[:, 0:border_size, :] = [0, 0, 255]  # Left border
+                motion_labeled[:, -border_size:, :] = [0, 0, 255]  # Right border
+                print("Added red border to motion frame for debugging")
+        
         # Stitch frames horizontally
         stitched = np.hstack((original_labeled, motion_labeled, color_labeled))
         
@@ -524,7 +542,7 @@ class SideBySideMagnification:
                 current_frame = binned_frames[current_bin_idx]
                 frame_info = f"Current: Frame {frame_idx+1}/{total_frames}"
                 fig.text(0.02, 0.02, frame_info, fontsize=10, 
-                      bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
+                   bbox=dict(facecolor='white', alpha=0.8, boxstyle='round'))
             
             # Adjust layout 
             plt.tight_layout()
@@ -986,7 +1004,7 @@ class SideBySideMagnification:
             else:
                 # Always use consistent x-axis limits regardless of data length
                 ax.set_xlim(0, max_len-1)
-                
+            
             # Set tick positions at intervals appropriate for frame numbers
             x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
             if x_range > 1000:
@@ -1906,87 +1924,112 @@ class SideBySideMagnification:
         # This overrides the default regions in the FacialPhaseMagnification class
         self.motion_processor.detect_face_regions = self.detect_micro_expression_regions
         
-        # STEP 1: Process the full video with PBM magnification first
-        # This ensures that motion magnification is applied using the PBM algorithm
-        print("Processing video with Phase-Based Motion (PBM) magnification...")
-        self.motion_processor.process_video(input_path, motion_output_path)
-        
-        # STEP 2: Read the PBM-magnified video frames
-        print("Reading PBM-magnified frames...")
-        motion_cap = cv2.VideoCapture(motion_output_path)
+        # Create a separate array for motion-magnified frames (PBM) with DEEP copies
+        # IMPORTANT: We need to make deep copies to avoid modifying the original frames
         motion_frames = []
+        for frame in all_frames:
+            motion_frames.append(frame.copy())
         
-        while True:
-            ret, frame = motion_cap.read()
-            if not ret:
-                break
-            motion_frames.append(frame)
+        print(f"Created {len(motion_frames)} deep copies for PBM magnification")
         
-        motion_cap.release()
+        # STEP 1: We'll directly apply PBM to each region and capture phase changes
+        print("Processing video with Phase-Based Motion (PBM) magnification...")
         
-        # STEP 3: Calculate phase changes from the PBM-magnified video frames
-        # This ensures all motion analysis is based on the PBM-magnified output
-        print("Calculating phase changes from PBM-magnified frames...")
+        # Detect all face regions in each frame
+        faces_by_frame = []
+        for i, frame in enumerate(all_frames):
+            if i % 10 == 0:
+                print(f"Detecting face regions in frame {i}/{len(all_frames)}")
+            faces = self.detect_micro_expression_regions(frame)
+            faces_by_frame.append(faces)
+        
+        # Define key regions to track
         motion_regions = ['left_eye', 'right_eye', 'nose_tip']  # Explicitly exclude mouth region
         
-        for i in range(min(len(motion_frames)-1, len(all_frames)-1)):  # Need at least 2 frames for comparison
-            # Detect face regions for the current magnified frame
-            face_data = self.detect_micro_expression_regions(motion_frames[i])
+        # Process each region separately
+        for key_region in motion_regions:
+            print(f"Processing region: {key_region}")
+            region_key = f"face1_{key_region}"
             
-            if 'regions' in face_data and len(face_data['regions']) > 0:
-                # Process each motion region
-                for region_name, region_info in face_data['regions'].items():
-                    # Check if this is one of the key regions we want to track
-                    key_region = None
-                    if 'left' in region_name and 'eye' in region_name:
-                        key_region = 'left_eye'
-                    elif 'right' in region_name and 'eye' in region_name:
-                        key_region = 'right_eye'
-                    elif region_name == 'nose_tip' or 'nose' in region_name:
-                        key_region = 'nose_tip'  # Standardize all nose regions to nose_tip
-                    
-                    # Only track the key regions
-                    if key_region:
-                        region_key = f"face1_{key_region}"
-                        # Extract the region image from the magnified frame
-                        region_img = region_info['image']
-                        
-                        # Get previous region from magnified frames
-                        prev_face_data = self.detect_micro_expression_regions(motion_frames[max(0, i-1)])
-                        
-                        if 'regions' in prev_face_data:
-                            # Find matching region in previous magnified frame
-                            prev_region_img = None
-                            for prev_name, prev_info in prev_face_data['regions'].items():
-                                if (('left' in prev_name and 'eye' in prev_name and key_region == 'left_eye') or
-                                    ('right' in prev_name and 'eye' in prev_name and key_region == 'right_eye') or
-                                    ('nose' in prev_name and key_region == 'nose_tip')):
-                                    prev_region_img = prev_info['image']
-                                    break
-                            
-                            if prev_region_img is not None:
-                                # Compute phase change between magnified frames
-                                # Using the simpler method that works directly on magnified frames
-                                phase_change = self.compute_phase_change(region_img, prev_region_img)
-                                
-                                # Ensure the region key exists in the dictionary
-                                if region_key not in all_phase_changes:
-                                    all_phase_changes[region_key] = [0.0] * i  # Fill with zeros for previous frames
-                                
-                                all_phase_changes[region_key].append(phase_change)
-                            else:
-                                # If previous region not found, use a small random value to avoid flat line
-                                if region_key not in all_phase_changes:
-                                    all_phase_changes[region_key] = [0.0] * i
-                                all_phase_changes[region_key].append(0.01)
-                        else:
-                            # No previous regions at all
-                            if region_key not in all_phase_changes:
-                                all_phase_changes[region_key] = [0.0] * i
-                            all_phase_changes[region_key].append(0.01)
+            # Collect all frames for this region
+            region_frames = []
+            frame_indices = []
             
-            if i % 10 == 0:
-                print(f"Processed phase changes for {i}/{len(motion_frames)} frames")
+            for i, face_data in enumerate(faces_by_frame):
+                if 'regions' in face_data:
+                    # Find the region in this frame's face data
+                    for region_name, region_info in face_data['regions'].items():
+                        if ((key_region == 'left_eye' and 'left' in region_name and 'eye' in region_name) or
+                            (key_region == 'right_eye' and 'right' in region_name and 'eye' in region_name) or
+                            (key_region == 'nose_tip' and (region_name == 'nose_tip' or 'nose' in region_name))):
+                            # Found a match
+                            region_frames.append(region_info['image'])
+                            frame_indices.append(i)
+                            break
+                                
+            if region_frames:
+                print(f"Collected {len(region_frames)} frames for {region_key}")
+                
+                # IMPORTANT CHANGE: Use PBM directly to get phase changes
+                # The magnify method returns both magnified frames and phase changes
+                magnified_frames, phase_changes = self.motion_processor.phase_magnifier.magnify(region_frames)
+                
+                # Store the phase changes directly for visualization
+                all_phase_changes[region_key] = phase_changes
+                
+                print(f"Extracted {len(phase_changes)} phase change values for {region_key}")
+                
+                # Apply the magnified frames back to the motion_frames array ONLY (not original frames)
+                for mag_idx, frame_idx in enumerate(frame_indices):
+                    if mag_idx < len(magnified_frames) and frame_idx < len(motion_frames):
+                        # Get the face data for this frame
+                        face_data = faces_by_frame[frame_idx]
+                        if 'regions' in face_data:
+                            # Find the matching region
+                            for region_name, region_info in face_data['regions'].items():
+                                if ((key_region == 'left_eye' and 'left' in region_name and 'eye' in region_name) or
+                                    (key_region == 'right_eye' and 'right' in region_name and 'eye' in region_name) or
+                                    (key_region == 'nose_tip' and (region_name == 'nose_tip' or 'nose' in region_name))):
+                                    # Get region bounds
+                                    bounds = region_info['bounds']
+                                    magnified = magnified_frames[mag_idx]
+                                    
+                                    # Ensure magnified region is the right size
+                                    if magnified.shape[:2] != (bounds[3]-bounds[1], bounds[2]-bounds[0]):
+                                        magnified = cv2.resize(magnified, 
+                                                            (bounds[2]-bounds[0], bounds[3]-bounds[1]))
+                                    
+                                    # Apply magnified region to the MOTION frames only
+                                    motion_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]] = magnified
+                                    
+                                    if frame_idx == 100:  # Debug - save a sample frame
+                                        debug_dir = os.path.join(os.path.dirname(output_path), "debug")
+                                        os.makedirs(debug_dir, exist_ok=True)
+                                        debug_path = os.path.join(debug_dir, f"{key_region}_frame_{frame_idx}.jpg")
+                                        cv2.imwrite(debug_path, motion_frames[frame_idx])
+                                    
+                break
+        
+        # Verify we have distinct original and motion frames
+        print(f"Verifying original vs motion frames:")
+        for i in range(0, len(all_frames), 100):
+            if i < len(all_frames) and i < len(motion_frames):
+                # Compare a few random pixels
+                diff = cv2.absdiff(all_frames[i], motion_frames[i])
+                diff_mean = np.mean(diff)
+                print(f"Frame {i}: Mean diff = {diff_mean}")
+                
+                # Save debug images
+                debug_dir = os.path.join(os.path.dirname(output_path), "debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                
+                # Save original, motion, and difference frames
+                cv2.imwrite(os.path.join(debug_dir, f"original_{i}.jpg"), all_frames[i])
+                cv2.imwrite(os.path.join(debug_dir, f"motion_{i}.jpg"), motion_frames[i])
+                cv2.imwrite(os.path.join(debug_dir, f"diff_{i}.jpg"), diff)
+        
+        # No need to save magnified frames as motion_frames - already done above
+        print("Using phase changes directly from PBM magnification process")
         
         print("Applying color magnification for heart rate detection...")
         # Process with color magnification using a more conservative blend factor
@@ -2416,11 +2459,12 @@ class SideBySideMagnification:
                 f"• Phase Amp: {motion_params['Phase Mag']}x\n"
                 f"• Freq Band: {motion_params['Freq Range']}\n"
                 f"• Filter: σ={motion_params['Sigma']}\n\n"
-                "MOVEMENT ANALYSIS\n"
-                "• Red points indicate significant\n  movement periods\n"
+                "PHASE CHANGES\n"
+                "• Graphs show actual phase shifts\n  detected and magnified by PBM\n"
+                "• Raw: Original phase variations\n"
+                "• Frame-to-Frame: Changes in phase\n"
                 "• 0.5-second aggregation window\n"
-                "• Y-axis expanded to show more\n  movement range\n"
-                "• X-axis shows frame numbers\n  across full video range\n\n"
+                "• Y-axis expanded to show more\n  movement range\n\n"
                 "COLOR MAGNIFICATION (EVM)\n"
                 f"• Alpha: {color_params['Alpha']}\n"
                 f"• Freq Band: {color_params['Low Freq']} -\n  {color_params['High Freq']}"

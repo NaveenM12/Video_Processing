@@ -966,8 +966,7 @@ class SideBySideMagnification:
                     scaled_x_max = max_len
                     ax.set_xlim(scaled_x_min, scaled_x_max)
                 else:
-                # Always use consistent x-axis limits regardless of data length
-                ax.set_xlim(0, max_len-1)
+                    # Always use consistent x-axis limits regardless of data length
                     ax.set_xlim(x_min, x_max)
             else:
                 # Always use consistent x-axis limits regardless of data length
