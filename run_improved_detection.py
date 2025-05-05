@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.join(ROOT_DIR, "Face_Color_Magnification"))
 
 # Import from the original implementation
 from Automatic_Lie_Detector.automatic_lie_detector import AutomaticLieDetector
-from Separate_Color_Motion_Magnification.fixed_side_by_side_magnification import SideBySideMagnification
+# Comment out the problematic import that isn't needed for our implementation
+# from Separate_Color_Motion_Magnification.fixed_side_by_side_magnification import SideBySideMagnification
 import Separate_Color_Motion_Magnification.config as config
 
 # Import the improved detection function from run_focused_detection.py
@@ -80,15 +81,16 @@ def compute_frame_difference(prev_frame, curr_frame):
     
     return motion_magnitude
 
-def find_significant_movement_region(input_path, window_size=30, threshold_factor=1.5):
+def find_significant_movement_region(input_path, window_size=30, threshold_factor=1.5, bin_size=15):
     """
-    Analyze video to find frames with significant movement clusters,
+    Analyze video to find frames with significant movement clusters based on aggregated bins,
     with special attention to the frames 200-300 region.
     
     Args:
         input_path: Path to input video
         window_size: Size of the window for peak detection (in frames)
         threshold_factor: Factor to determine significance threshold
+        bin_size: Size of bins for aggregating frames (default: 15 frames)
         
     Returns:
         Tuple of (start_frame, end_frame) for the region with most significant movement
@@ -150,105 +152,136 @@ def find_significant_movement_region(input_path, window_size=30, threshold_facto
     # Convert to numpy array
     smoothed_magnitudes = np.array(smoothed_magnitudes)
     
-    # Compute first derivative to detect changes in motion (peaks)
-    motion_changes = np.diff(smoothed_magnitudes)
-    motion_changes = np.insert(motion_changes, 0, 0)  # Add zero at the beginning
+    # Step 1: Bin the data into fixed-size bins (15 frames per bin)
+    num_bins = max(1, int(np.ceil(actual_frame_count / bin_size)))
     
-    # Look for areas with high variability/peaks (micro-expressions)
-    # Calculate rolling standard deviation which highlights regions with rapid changes
-    rolling_std = []
-    std_window = deque(maxlen=window_size)
+    # Initialize arrays for binned data
+    binned_frames = []      # Center of each bin in frame units
+    binned_values = []      # Average motion value in each bin
     
-    for change in motion_changes:
-        std_window.append(change)
-        if len(std_window) > 1:
-            rolling_std.append(np.std(std_window))
-        else:
-            rolling_std.append(0)
-    
-    rolling_std = np.array(rolling_std)
-    
-    # Compute peak density analysis to find regions with clusters of peaks
-    peak_density = np.zeros(actual_frame_count)
-    
-    # Use a sliding window to compute peak density
-    for i in range(actual_frame_count):
-        start_idx = max(0, i - window_size)
-        end_idx = min(actual_frame_count, i + window_size)
-        segment = smoothed_magnitudes[start_idx:end_idx]
+    # Process each bin
+    for bin_idx in range(num_bins):
+        # Calculate start and end frame indices for this bin
+        start_frame = bin_idx * bin_size
+        end_frame = min(actual_frame_count, start_frame + bin_size)
         
-        if len(segment) > 2:
-            # Detect peaks in this window
-            # A point is a peak if it's larger than both neighbors
-            is_peak = np.zeros(len(segment), dtype=bool)
-            for j in range(1, len(segment)-1):
-                if segment[j] > segment[j-1] and segment[j] > segment[j+1]:
-                    is_peak[j] = True
-            
-            # Count peaks in this window
-            peak_count = np.sum(is_peak)
-            peak_density[i] = peak_count
+        # Calculate bin center frame for x-axis
+        bin_center_frame = start_frame + (end_frame - start_frame) // 2
+        binned_frames.append(bin_center_frame)
+        
+        # Get motion data for this bin
+        bin_data = smoothed_magnitudes[start_frame:end_frame]
+        
+        if len(bin_data) > 0:
+            # Calculate average motion in this bin
+            bin_avg = np.mean(bin_data)
+            binned_values.append(bin_avg)
+        else:
+            binned_values.append(0)
     
-    # Normalize peak density
-    if np.max(peak_density) > 0:
-        peak_density = peak_density / np.max(peak_density)
+    # Convert to numpy arrays
+    binned_frames = np.array(binned_frames)
+    binned_values = np.array(binned_values)
     
-    # Check if we have enough frames to analyze the target region (200-300)
-    target_start = min(200, actual_frame_count - 1)
-    target_end = min(300, actual_frame_count)
+    # Step 2: Calculate threshold for significant bins
+    bin_mean = np.mean(binned_values)
+    bin_std = np.std(binned_values)
+    bin_threshold = bin_mean + (threshold_factor * bin_std)
+    
+    # Step 3: Find significant bins (those above threshold)
+    significant_bins = np.where(binned_values > bin_threshold)[0]
+    
+    # Step 4: Look for clusters of significant bins
+    # Calculate the density of significant bins using a sliding window
+    significant_bin_density = np.zeros(len(binned_frames))
+    sliding_window = max(1, window_size // bin_size)  # Adjust window size for binned data
+    
+    for i in range(len(binned_frames)):
+        # Define the window range
+        start_idx = max(0, i - sliding_window)
+        end_idx = min(len(binned_frames), i + sliding_window + 1)
+        
+        # Count significant bins in this window
+        bin_indices_in_window = np.arange(start_idx, end_idx)
+        significant_in_window = np.isin(bin_indices_in_window, significant_bins)
+        significant_bin_density[i] = np.sum(significant_in_window)
+    
+    # Normalize the density
+    if np.max(significant_bin_density) > 0:
+        significant_bin_density = significant_bin_density / np.max(significant_bin_density)
+    
+    # Check if we have enough bins to analyze the target region (200-300)
+    target_bin_start = np.argmin(np.abs(binned_frames - 200)) if 200 < actual_frame_count else 0
+    target_bin_end = np.argmin(np.abs(binned_frames - 300)) if 300 < actual_frame_count else len(binned_frames) - 1
     
     # Apply a boost to the target region for better detection
-    # This ensures we focus on the region showing significant movement in the micro-expression graph
-    if target_end > target_start:
-        # Calculate mean peak density in the target region
-        target_region_density = peak_density[target_start:target_end]
+    if target_bin_end > target_bin_start:
+        # Calculate mean density in the target region
+        target_region_density = significant_bin_density[target_bin_start:target_bin_end]
         target_mean = np.mean(target_region_density) if len(target_region_density) > 0 else 0
         
         # Apply a boost if there's any activity in the target region
         if target_mean > 0.1:
             # Boost the target region
             boost_factor = max(1.5, 1.0 / target_mean) if target_mean > 0 else 1.5
-            peak_density[target_start:target_end] *= min(boost_factor, 3.0)  # Cap the boost
+            significant_bin_density[target_bin_start:target_bin_end] *= min(boost_factor, 3.0)  # Cap the boost
             
             # Renormalize if needed
-            if np.max(peak_density) > 1.0:
-                peak_density = peak_density / np.max(peak_density)
+            if np.max(significant_bin_density) > 1.0:
+                significant_bin_density = significant_bin_density / np.max(significant_bin_density)
     
-    # Now check if target region has significant activity
-    target_region_density = peak_density[target_start:target_end]
+    # Check if target region has significant activity
+    target_region_density = significant_bin_density[target_bin_start:target_bin_end]
     
     # Always prefer the target region if it has decent activity
     if len(target_region_density) > 0 and np.max(target_region_density) > 0.5:
-        print(f"Found significant movement in target region (frames {target_start}-{target_end})")
+        print(f"Found significant movement in target region (frames {binned_frames[target_bin_start]}-{binned_frames[target_bin_end]})")
         
         # Get the center of the region with highest density within target region
-        max_density_idx = target_start + np.argmax(target_region_density)
+        max_density_idx = target_bin_start + np.argmax(target_region_density)
+        max_density_frame = binned_frames[max_density_idx]
         
-        # Calculate an expanded window centered around max_density_idx
-        # to include the complete 200-300 range if possible
-        start_frame = max(0, target_start - 20)  # Include some context before
-        end_frame = min(actual_frame_count - 1, target_end + 20)  # And after
+        # Calculate frame range covering significant bins around the maximum
+        # Include at least 3 bins on each side
+        bin_window = max(3, sliding_window // 2)
+        start_bin_idx = max(0, max_density_idx - bin_window)
+        end_bin_idx = min(len(binned_frames) - 1, max_density_idx + bin_window)
+        
+        # Convert bin indices to frame ranges
+        start_frame = max(0, int(binned_frames[start_bin_idx] - bin_size // 2))
+        end_frame = min(actual_frame_count - 1, int(binned_frames[end_bin_idx] + bin_size // 2))
         
         print(f"Detected significant movement region: frames {start_frame}-{end_frame}")
         print(f"Peak density in target region: {np.max(target_region_density):.2f}")
         return start_frame, end_frame
     
     # If target region doesn't have enough activity, fall back to finding the max across the whole video
-    max_density_idx = np.argmax(peak_density)
+    max_density_idx = np.argmax(significant_bin_density)
+    max_density_frame = binned_frames[max_density_idx]
     
     # If the max is close to the target region, expand to include it
-    if 150 <= max_density_idx <= 350:
+    if 150 <= max_density_frame <= 350:
         # Ensure we include frames 200-300 in our detection
-        start_frame = max(0, min(max_density_idx - 50, target_start - 20))
-        end_frame = min(actual_frame_count - 1, max(max_density_idx + 50, target_end + 20))
+        # Find bins that cover the frame range 180-320
+        expanded_start_bin_idx = np.argmin(np.abs(binned_frames - 180))
+        expanded_end_bin_idx = np.argmin(np.abs(binned_frames - 320))
+        
+        # Convert bin indices to frame ranges
+        start_frame = max(0, int(binned_frames[expanded_start_bin_idx] - bin_size // 2))
+        end_frame = min(actual_frame_count - 1, int(binned_frames[expanded_end_bin_idx] + bin_size // 2))
     else:
         # Otherwise just use a window around the maximum
-        start_frame = max(0, max_density_idx - 50)
-        end_frame = min(actual_frame_count - 1, max_density_idx + 50)
+        bin_window = max(3, window_size // bin_size)  # Use at least 3 bins
+        start_bin_idx = max(0, max_density_idx - bin_window)
+        end_bin_idx = min(len(binned_frames) - 1, max_density_idx + bin_window)
+        
+        # Convert bin indices to frame ranges
+        start_frame = max(0, int(binned_frames[start_bin_idx] - bin_size // 2))
+        end_frame = min(actual_frame_count - 1, int(binned_frames[end_bin_idx] + bin_size // 2))
     
     print(f"Detected significant movement region: frames {start_frame}-{end_frame}")
-    print(f"Peak density: {peak_density[max_density_idx]:.2f}")
-    return start_frame, end_frame 
+    print(f"Peak density: {significant_bin_density[max_density_idx]:.2f}")
+    return start_frame, end_frame
 
 def compute_smoothed_movement_data(input_path, window_size=30):
     """
@@ -514,7 +547,7 @@ class ImprovedDetector:
         self.deception_region = None
         self.heart_rate_data = None
         
-    def process_video(self, input_path, output_path, window_size=30, threshold_factor=1.5):
+    def process_video(self, input_path, output_path, window_size=30, threshold_factor=1.5, bin_size=15):
         """
         Process a video to detect deception with improved algorithms
         
@@ -523,6 +556,7 @@ class ImprovedDetector:
             output_path: Path to output video
             window_size: Size of window for peak detection
             threshold_factor: Factor for significance threshold
+            bin_size: Size of bins for aggregating frames (default: 15 frames)
         """
         print(f"Processing video: {input_path}")
         print(f"Output will be saved to: {output_path}")
@@ -544,9 +578,9 @@ class ImprovedDetector:
         else:
             print(f"Heart rate calculation complete. Average BPM: {self.heart_rate_data['avg_bpm']:.1f}")
         
-        # Step 3: Detect the region with significant movement
+        # Step 3: Detect the region with significant movement using the specified bin size
         self.deception_region = find_significant_movement_region(
-            input_path, window_size, threshold_factor
+            input_path, window_size, threshold_factor, bin_size
         )
         
         if not self.deception_region:
@@ -697,7 +731,8 @@ class ImprovedDetector:
         
     def _create_deception_timeline_enhanced(self, current_frame, total_frames, fps, deception_window, width, height):
         """
-        Create an enhanced visualization of the deception timeline in the same aspect ratio as other plots
+        Create an enhanced visualization of the deception timeline showing binned data analysis
+        in the same aspect ratio as other plots
         
         Args:
             current_frame: Current frame index
@@ -743,11 +778,19 @@ class ImprovedDetector:
                 fontsize=12, color='red', fontweight='bold',
                 transform=ax.transAxes)
         
-        # Add peak count info
-        peak_text = f"Detected {peak_count} significant micro-expression peaks"
-        ax.text(0.5, 0.8, peak_text, 
+        # Add peak count and binning info
+        bin_size = 15  # Match bin size used in other plots
+        bin_text = f"Detected {peak_count} significant micro-expression peaks across {int(np.ceil((end_frame-start_frame)/bin_size))} bins" 
+        ax.text(0.5, 0.8, bin_text, 
                 horizontalalignment='center', 
                 fontsize=11, color='black',
+                transform=ax.transAxes)
+        
+        # Add the bins explanation
+        bins_info = "Analysis uses 15-frame bins to aggregate movement data and identify deception regions"
+        ax.text(0.5, 0.72, bins_info,
+                horizontalalignment='center',
+                fontsize=9, color='darkblue',
                 transform=ax.transAxes)
         
         # Draw main timeline ruler
@@ -757,6 +800,17 @@ class ImprovedDetector:
         for t in range(int(total_time) + 1):
             ax.plot([t, t], [0.48, 0.52], 'k-', linewidth=1, alpha=0.5)
             ax.text(t, 0.45, f"{t}s", fontsize=9, ha='center')
+        
+        # Create the binned regions visual representation
+        # Create bin markings on timeline
+        bin_duration_sec = bin_size / fps
+        num_bins = int(np.ceil(total_time / bin_duration_sec))
+        
+        # Draw subtle bin separators
+        for b in range(num_bins + 1):
+            bin_time = b * bin_duration_sec
+            if bin_time <= total_time:
+                ax.axvline(x=bin_time, color='lightgray', linestyle='-', linewidth=0.5, alpha=0.5)
         
         # Draw the deception region as a red bar
         bar_height = 0.2
@@ -786,6 +840,20 @@ class ImprovedDetector:
         ax.plot(current_time, 0.5, 'go', markersize=10)
         ax.text(current_time, 0.35, f"Current: {current_time:.2f}s", 
                 fontsize=10, color='green', fontweight='bold', ha='center')
+        
+        # Calculate which bin the current frame is in
+        current_bin = int(current_frame / bin_size)
+        current_bin_start_time = (current_bin * bin_size) / fps
+        current_bin_end_time = min(total_time, ((current_bin + 1) * bin_size) / fps)
+        
+        # Highlight the current bin with a subtle highlight
+        ax.axvspan(current_bin_start_time, current_bin_end_time, 
+                  ymin=0.2, ymax=0.8, alpha=0.1, color='green')
+        
+        # Show current bin information
+        bin_info_text = f"Current Bin: {current_bin} ({current_bin_start_time:.2f}s - {current_bin_end_time:.2f}s)"
+        ax.text(current_time + 0.2, 0.25, bin_info_text, 
+                fontsize=9, color='green', ha='left')
                 
         # Remove y-axis ticks and labels
         ax.set_yticks([])
@@ -847,6 +915,7 @@ class ImprovedDetector:
     def _create_movement_plot(self, frame_idx, total_frames, fps, smoothed_motion, raw_motion, deception_window, width, height):
         """
         Create a plot of micro-expression movement data with aggregated peaks
+        using bins of 15 frames for smoother visualization
         
         Args:
             frame_idx: Current frame index
@@ -874,19 +943,17 @@ class ImprovedDetector:
         # Calculate the threshold for significant movement
         threshold = np.mean(smoothed_motion) + 1.5 * np.std(smoothed_motion)
         
-        # Bin the motion data to aggregate it effectively
-        # Use a window-based approach to match the previous visualization
-        bin_size = int(fps)  # Use 1-second bins by default
-        if bin_size < 1:
-            bin_size = 1
+        # Bin the motion data using a fixed bin size of 15 frames
+        bin_size = 15  # Use 15-frame bins as specified
             
         # Calculate number of bins
         num_bins = max(1, int(np.ceil(total_frames / bin_size)))
         
         # Initialize arrays for binned data
-        binned_frames = []  # Center of each bin in frame units
-        binned_values = []  # Average motion value in each bin
-        binned_peaks = []   # Number of peaks in each bin
+        binned_frames = []      # Center of each bin in frame units
+        binned_values = []      # Average motion value in each bin
+        binned_max_values = []  # Maximum motion value in each bin
+        binned_peaks = []       # Number of peaks in each bin
         binned_above_threshold = []  # Flag if bin has values above threshold
         
         # Identify peaks in the smoothed motion data
@@ -914,6 +981,10 @@ class ImprovedDetector:
                 bin_avg = np.mean(bin_data)
                 binned_values.append(bin_avg)
                 
+                # Calculate maximum motion in this bin
+                bin_max = np.max(bin_data)
+                binned_max_values.append(bin_max)
+                
                 # Count peaks in this bin
                 bin_peaks = sum(1 for p in peaks if start_frame <= p < end_frame)
                 binned_peaks.append(bin_peaks)
@@ -923,20 +994,35 @@ class ImprovedDetector:
                 binned_above_threshold.append(above_threshold)
             else:
                 binned_values.append(0)
+                binned_max_values.append(0)
                 binned_peaks.append(0)
                 binned_above_threshold.append(False)
         
         # Convert to numpy arrays
         binned_frames = np.array(binned_frames)
         binned_values = np.array(binned_values)
+        binned_max_values = np.array(binned_max_values)
         binned_peaks = np.array(binned_peaks)
         binned_above_threshold = np.array(binned_above_threshold)
         
-        # Plot the smoothed motion data as a green line
-        ax.plot(smoothed_motion, 'g-', linewidth=2, label='Movement Magnitude')
+        # Calculate aggregate threshold for binned data
+        binned_threshold = np.mean(binned_values) + 1.5 * np.std(binned_values)
         
-        # Add a more subtle plot of the raw motion data
-        ax.plot(raw_motion, 'g-', alpha=0.2, linewidth=0.5)
+        # Plot the raw data with lower opacity for reference
+        ax.plot(smoothed_motion, 'g-', linewidth=1, alpha=0.2, label='Frame Movement')
+        
+        # Plot the binned data as the main focus
+        ax.plot(binned_frames, binned_values, 'g-', linewidth=2.5, 
+               marker='o', markersize=6, markerfacecolor='green', markeredgecolor='black',
+               markeredgewidth=1, alpha=0.9, label='Movement Magnitude')
+        
+        # Mark significant bins with red dots
+        significant_bin_indices = np.where(binned_values > binned_threshold)[0]
+        if len(significant_bin_indices) > 0:
+            significant_bin_frames = binned_frames[significant_bin_indices]
+            significant_bin_values = binned_values[significant_bin_indices]
+            ax.plot(significant_bin_frames, significant_bin_values, 'ro', 
+                   markersize=8, label='Significant Movement')
         
         # Highlight deception region with red background
         # Use deception window from the detection algorithm
@@ -944,18 +1030,16 @@ class ImprovedDetector:
         end = deception_window['end_frame']
         ax.axvspan(start, end, alpha=0.2, color='red')
         
-        # Mark significant peaks with red dots
-        significant_indices = np.where(smoothed_motion > threshold)[0]
-        if len(significant_indices) > 0:
-            ax.plot(significant_indices, smoothed_motion[significant_indices], 'ro', 
-                   markersize=5, label='Significant Movement')
-        
         # Add vertical line for current frame
         ax.axvline(x=frame_idx, color='blue', linestyle='-', linewidth=2)
         
         # Add current frame marker (blue dot)
         if 0 <= frame_idx < len(smoothed_motion):
-            ax.plot(frame_idx, smoothed_motion[frame_idx], 'bo', markersize=8)
+            # Find the bin containing the current frame
+            current_bin_idx = np.argmin(np.abs(binned_frames - frame_idx)) if len(binned_frames) > 0 else 0
+            if current_bin_idx < len(binned_values):
+                # Plot marker at the bin value rather than the raw frame value
+                ax.plot(frame_idx, binned_values[current_bin_idx], 'bo', markersize=10)
         
         # Set labels and title
         ax.set_title('Combined Micro-Expressions: Aggregated Movement', fontsize=14, fontweight='bold')
@@ -965,8 +1049,8 @@ class ImprovedDetector:
         # Set x-axis limits
         ax.set_xlim(0, total_frames)
         
-        # Add threshold line
-        ax.axhline(y=threshold, color='red', linestyle='--', alpha=0.5, label='Threshold')
+        # Add threshold line for binned data
+        ax.axhline(y=binned_threshold, color='red', linestyle='--', alpha=0.5, label='Threshold')
         
         # Add legend
         ax.legend(loc='upper right')
@@ -976,9 +1060,13 @@ class ImprovedDetector:
         
         # Add current frame text
         if 0 <= frame_idx < len(smoothed_motion):
+            # Find the bin containing the current frame
+            current_bin_idx = np.argmin(np.abs(binned_frames - frame_idx)) if len(binned_frames) > 0 else 0
+            current_bin_value = binned_values[current_bin_idx] if current_bin_idx < len(binned_values) else 0
+            
             ax.text(
                 0.02, 0.95, 
-                f"Current: Frame {frame_idx}/{total_frames}", 
+                f"Current: Frame {frame_idx}/{total_frames} (Bin value: {current_bin_value:.4f})", 
                 transform=ax.transAxes, fontsize=10,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
             )
@@ -1012,7 +1100,8 @@ class ImprovedDetector:
     
     def _create_heart_rate_plot(self, frame_idx, total_frames, heart_rate_data, width, height):
         """
-        Create a heart rate plot showing BPM over time
+        Create a heart rate plot showing BPM over time, with data aggregated in 15-frame bins
+        for smoother visualization
         
         Args:
             frame_idx: Current frame index
@@ -1053,11 +1142,51 @@ class ImprovedDetector:
         bpm_per_frame = heart_rate_data['bpm_per_frame']
         avg_bpm = heart_rate_data['avg_bpm']
         
+        # Bin the BPM data to create smoother visualization
+        bin_size = 15  # Use 15-frame bins as specified
+        
+        # Calculate number of bins needed
+        num_bins = max(1, int(np.ceil(len(bpm_per_frame) / bin_size)))
+        
+        # Initialize arrays for binned data
+        binned_frames = []      # Center of each bin in frame units
+        binned_bpm_values = []  # Average BPM value in each bin
+        
+        # Process each bin
+        for bin_idx in range(num_bins):
+            # Calculate start and end frame indices for this bin
+            start_frame = bin_idx * bin_size
+            end_frame = min(len(bpm_per_frame), start_frame + bin_size)
+            
+            # Calculate bin center frame for x-axis
+            bin_center_frame = start_frame + (end_frame - start_frame) // 2
+            binned_frames.append(bin_center_frame)
+            
+            # Get BPM data for this bin
+            bin_data = bpm_per_frame[start_frame:end_frame]
+            
+            if len(bin_data) > 0:
+                # Calculate average BPM in this bin
+                bin_avg = np.mean(bin_data)
+                binned_bpm_values.append(bin_avg)
+            else:
+                # If no data (should not happen), use average
+                binned_bpm_values.append(avg_bpm)
+        
+        # Convert to numpy arrays
+        binned_frames = np.array(binned_frames)
+        binned_bpm_values = np.array(binned_bpm_values)
+        
         # Create x-axis (frame numbers)
         x = np.arange(len(bpm_per_frame))
         
-        # Plot heart rate data (BPM per frame)
-        ax.plot(x, bpm_per_frame, 'r-', linewidth=2, label='Heart Rate (BPM)')
+        # Plot original heart rate data with lower opacity for reference
+        ax.plot(x, bpm_per_frame, 'r-', linewidth=1, alpha=0.2, label='Frame BPM')
+        
+        # Plot the binned data as the main focus
+        ax.plot(binned_frames, binned_bpm_values, 'r-', linewidth=2.5, 
+               marker='o', markersize=6, markerfacecolor='red', markeredgecolor='black',
+               markeredgewidth=1, alpha=0.9, label='Heart Rate (BPM)')
         
         # Add horizontal line for average BPM
         ax.axhline(y=avg_bpm, color='blue', linestyle='--', linewidth=1.5, 
@@ -1066,8 +1195,12 @@ class ImprovedDetector:
         # Add vertical line for current frame
         ax.axvline(x=frame_idx, color='green', linestyle='-', linewidth=2)
         
-        # Add current frame marker with current BPM
-        current_bpm = bpm_per_frame[frame_idx] if frame_idx < len(bpm_per_frame) else avg_bpm
+        # Add current frame marker with current BPM (from binned data)
+        # Find the bin containing the current frame
+        current_bin_idx = np.argmin(np.abs(binned_frames - frame_idx)) if len(binned_frames) > 0 else 0
+        current_bpm = binned_bpm_values[current_bin_idx] if current_bin_idx < len(binned_bpm_values) else avg_bpm
+        
+        # Plot marker at current frame position
         ax.plot(frame_idx, current_bpm, 'go', markersize=10)
         
         # Add text annotation for current BPM
@@ -1087,8 +1220,8 @@ class ImprovedDetector:
         ax.set_xlim(0, total_frames)
         
         # Set y-axis limits to a normal heart rate range (with some padding)
-        min_bpm = max(40, np.min(bpm_per_frame) * 0.9)
-        max_bpm = min(180, np.max(bpm_per_frame) * 1.1)
+        min_bpm = max(40, np.min(binned_bpm_values) * 0.9)
+        max_bpm = min(180, np.max(binned_bpm_values) * 1.1)
         ax.set_ylim(min_bpm, max_bpm)
         
         # Add grid
@@ -1170,6 +1303,11 @@ def parse_arguments():
         help='Threshold factor for significant movement (default: 1.5)'
     )
     
+    parser.add_argument(
+        '--bin-size', '-b', type=int, default=15,
+        help='Size of bins for aggregating frames (default: 15 frames)'
+    )
+    
     return parser.parse_args()
 
 def main():
@@ -1197,7 +1335,8 @@ def main():
         args.input, 
         output_path,
         args.window,
-        args.threshold
+        args.threshold,
+        args.bin_size
     )
     
     if success:

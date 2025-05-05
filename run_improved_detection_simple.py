@@ -57,9 +57,15 @@ def parse_arguments():
         help='Frame range to focus on for deception detection (default: 200-300)'
     )
     
+    # Add bin size parameter for aggregation
+    parser.add_argument(
+        '--bin-size', '-b', type=int, default=15,
+        help='Size of bins for aggregating frames (default: 15 frames)'
+    )
+    
     return parser.parse_args()
 
-def process_single_video(video_path, output_dir, window_size=30, threshold_factor=1.5, focus_frames=None):
+def process_single_video(video_path, output_dir, window_size=30, threshold_factor=1.5, focus_frames=None, bin_size=15):
     """
     Process a single video using the improved detection algorithm
     
@@ -69,6 +75,7 @@ def process_single_video(video_path, output_dir, window_size=30, threshold_facto
         window_size: Size of window for movement detection
         threshold_factor: Factor for significance threshold
         focus_frames: Optional frame range to focus on (format: "start-end")
+        bin_size: Size of bins for aggregating frames (default: 15 frames)
     
     Returns:
         bool: True if successful, False otherwise
@@ -121,7 +128,8 @@ def process_single_video(video_path, output_dir, window_size=30, threshold_facto
         video_path, 
         output_path,
         window_size,
-        threshold_factor
+        threshold_factor,
+        bin_size
     )
     
     # Restore original function if we overrode it
@@ -150,7 +158,8 @@ def main():
             args.output,
             args.window,
             args.threshold,
-            args.focus_frames
+            args.focus_frames,
+            args.bin_size
         )
         return 0 if success else 1
     else:
