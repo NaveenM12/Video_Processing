@@ -2,50 +2,47 @@
 import os
 import glob
 from side_by_side_magnification import SideBySideMagnification
-from config import MOTION_MAG_PARAMS, COLOR_MAG_PARAMS, INPUT_VIDEO_PATH, OUTPUT_VIDEO_PATH
+from config import MOTION_MAG_PARAMS, COLOR_MAG_PARAMS
 
-def process_all_videos():
-    """
-    Simple batch processor for video magnification.
-    Processes all videos in trimmed_mp4 folder without modifying any parameters.
-    """
-    # Get workspace directory
-    workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def batch_process_videos():
+    """Process all videos in the trimmed_mp4 folder."""
+    # Input directory containing MP4 videos
+    input_dir = "/Users/naveenmirapuri/VideoProcessing/trimmed_mp4"
     
-    # Set up paths
-    input_dir = os.path.join(workspace_dir, "trimmed_mp4")
-    output_dir = os.path.join(workspace_dir, "2T_1L_outputs")
+    # Output directory for processed videos
+    output_dir = "output_videos"
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
-    # Get all mp4 files
+    # Get all MP4 files in the input directory
     input_files = sorted(glob.glob(os.path.join(input_dir, "*.mp4")))
     
-    print(f"Found {len(input_files)} videos to process")
-    
-    # Create a single processor instance
+    # Initialize the processor once with the parameters from config
     processor = SideBySideMagnification(
         motion_params=MOTION_MAG_PARAMS,
         color_params=COLOR_MAG_PARAMS
     )
     
     # Process each video
-    for i, input_file in enumerate(input_files, 1):
-        # Get just the filename
-        filename = os.path.basename(input_file)
-        output_file = os.path.join(output_dir, filename)
+    for input_file in input_files:
+        # Extract the base filename without extension
+        basename = os.path.basename(input_file)
+        file_number = os.path.splitext(basename)[0]  # Should be a number like "1", "2", etc.
         
-        print(f"\n[{i}/{len(input_files)}] Processing {filename}")
+        # Create output filename with _x suffix
+        output_file = os.path.join(output_dir, f"side_by_side_output_{file_number}.mp4")
         
-        # Process video with the original method
-        try:
-            processor.process_video(input_file, output_file)
-            print(f"Completed processing {filename}")
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
+        print(f"\n\n===== Processing {basename} =====")
+        print(f"Input: {input_file}")
+        print(f"Output: {output_file}")
+        
+        # Process the video
+        processor.process_video(input_file, output_file)
+        
+        print(f"===== Completed {basename} =====\n\n")
     
-    print("All videos processed!")
+    print(f"All {len(input_files)} videos have been processed.")
 
 if __name__ == "__main__":
-    process_all_videos() 
+    batch_process_videos() 
