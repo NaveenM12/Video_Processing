@@ -134,6 +134,9 @@ class PBMEVMDetector(AutomaticLieDetector):
             self.evm_processor.level = color_params.get('level', 3)
             self.evm_processor.f_lo = color_params.get('f_lo', 0.83)
             self.evm_processor.f_hi = color_params.get('f_hi', 1.0)
+            # Add chromAttenuation parameter if available
+            if 'chromAttenuation' in color_params:
+                self.evm_processor.chromAttenuation = color_params.get('chromAttenuation', 0.0)
     
     def create_deception_info_panel(self, frame_idx: int, plot_width: int, plot_height: int) -> np.ndarray:
         """
@@ -287,6 +290,9 @@ class PBMEVMDetector(AutomaticLieDetector):
         
         # Step 3: Apply EVM only to cheek regions for heart rate detection
         print("Step 2: Applying EVM for heart rate detection...")
+        print(f"EVM Parameters: alpha={self.evm_processor.alpha}, level={self.evm_processor.level}, "
+              f"f_lo={self.evm_processor.f_lo:.4f}, f_hi={self.evm_processor.f_hi:.4f}, "
+              f"chromAttenuation={getattr(self.evm_processor, 'chromAttenuation', 0.0):.2f}")
         
         # Initialize color magnified frames as copies of original frames
         magnified_color_frames = [frame.copy() for frame in all_frames]

@@ -47,12 +47,13 @@ PBM_PARAMS = {
 }
 
 # EVM parameters (Eulerian Video Magnification for heart rate detection)
-# Matching parameters from Face_Color_Magnification
+# Matching parameters from config.py COLOR_MAG_PARAMS
 EVM_PARAMS = {
-    'alpha': 50,             # Amplification factor (matches Face_Color_Magnification)
-    'level': 3,              # Pyramid level (matches Face_Color_Magnification)
-    'f_lo': 0.83,            # Low cutoff frequency (50 BPM, matches Face_Color_Magnification)
-    'f_hi': 3.0              # High cutoff frequency (increased to 180 BPM for better range)
+    'alpha': 40.0,            # Amplification factor
+    'level': 5,               # Pyramid level
+    'f_lo': 50/60,            # Low cutoff frequency (50 BPM)
+    'f_hi': 180/60,           # High cutoff frequency (180 BPM)
+    'chromAttenuation': 0.0   # No attenuation to maintain full signal for analysis
 }
 
 # Feature weights for detection (PBM/EVM exclusive)
