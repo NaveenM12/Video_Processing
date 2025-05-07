@@ -130,13 +130,16 @@ class PBMEVMDetector(AutomaticLieDetector):
         # Initialize EVM directly for heart rate analysis
         self.evm_processor = ColorMagnification()
         if color_params:
-            self.evm_processor.alpha = color_params.get('alpha', 50)
+            # Use exact parameters from config without hardcoding
+            self.evm_processor.alpha = color_params.get('alpha', 24.0) 
             self.evm_processor.level = color_params.get('level', 3)
             self.evm_processor.f_lo = color_params.get('f_lo', 0.83)
             self.evm_processor.f_hi = color_params.get('f_hi', 1.0)
-            # Add chromAttenuation parameter if available
             if 'chromAttenuation' in color_params:
                 self.evm_processor.chromAttenuation = color_params.get('chromAttenuation', 0.0)
+            else:
+                # Add default chromAttenuation to reduce color artifacts
+                self.evm_processor.chromAttenuation = 1.0
     
     def create_deception_info_panel(self, frame_idx: int, plot_width: int, plot_height: int) -> np.ndarray:
         """
@@ -345,7 +348,29 @@ class PBMEVMDetector(AutomaticLieDetector):
             for frame_idx, cheek_frame in enumerate(left_cheek_frames):
                 if cheek_frame is not None and left_idx < len(left_magnified):
                     bounds = left_cheek_bounds[frame_idx]
-                    magnified_color_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]] = left_magnified[left_idx]
+                    
+                    # Create a subtle blend instead of direct replacement
+                    original_region = magnified_color_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]].copy()
+                    magnified_region = left_magnified[left_idx].copy()
+                    
+                    # Ensure regions are the same size
+                    if magnified_region.shape[:2] != original_region.shape[:2]:
+                        magnified_region = cv2.resize(magnified_region, 
+                                                     (original_region.shape[1], original_region.shape[0]))
+                    
+                    # Make blend factor proportional to EVM alpha but keep it subtle
+                    max_blend = 0.25  # Maximum blend percentage allowed
+                    blend_factor = min(max_blend, self.evm_processor.alpha / 100.0)  # Scale based on alpha
+                    print(f"Using visual blend factor of {blend_factor:.2f} based on alpha={self.evm_processor.alpha}")
+                    blended_region = cv2.addWeighted(
+                        magnified_region, blend_factor,
+                        original_region, 1.0 - blend_factor,
+                        0
+                    )
+                    
+                    # Replace the region with the blended result
+                    magnified_color_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]] = blended_region
+                    
                     left_idx += 1
         
         # Apply EVM to right cheek regions
@@ -358,7 +383,29 @@ class PBMEVMDetector(AutomaticLieDetector):
             for frame_idx, cheek_frame in enumerate(right_cheek_frames):
                 if cheek_frame is not None and right_idx < len(right_magnified):
                     bounds = right_cheek_bounds[frame_idx]
-                    magnified_color_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]] = right_magnified[right_idx]
+                    
+                    # Create a subtle blend instead of direct replacement
+                    original_region = magnified_color_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]].copy()
+                    magnified_region = right_magnified[right_idx].copy()
+                    
+                    # Ensure regions are the same size
+                    if magnified_region.shape[:2] != original_region.shape[:2]:
+                        magnified_region = cv2.resize(magnified_region, 
+                                                     (original_region.shape[1], original_region.shape[0]))
+                    
+                    # Make blend factor proportional to EVM alpha but keep it subtle
+                    max_blend = 0.25  # Maximum blend percentage allowed
+                    blend_factor = min(max_blend, self.evm_processor.alpha / 100.0)  # Scale based on alpha
+                    print(f"Using visual blend factor of {blend_factor:.2f} based on alpha={self.evm_processor.alpha}")
+                    blended_region = cv2.addWeighted(
+                        magnified_region, blend_factor,
+                        original_region, 1.0 - blend_factor,
+                        0
+                    )
+                    
+                    # Replace the region with the blended result
+                    magnified_color_frames[frame_idx][bounds[1]:bounds[3], bounds[0]:bounds[2]] = blended_region
+                    
                     right_idx += 1
         
         # Calculate heart rate using EVM
