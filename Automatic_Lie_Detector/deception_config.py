@@ -30,8 +30,8 @@ MAX_WINDOW_SPAN = 90        # Maximum size of the detection window (in frames)
 DEFAULT_SPAN_IN_BINS = 6     # Number of bins to use around the most significant bin
 
 # Heart rate analysis parameters
-HEART_RATE_BIN_SIZE = 30    # Size of bins for heart rate data (larger for smoother curves)
-HEART_RATE_BOOST = 0.1      # Factor to boost detection score when heart rate confirms micro-expression
+HEART_RATE_BIN_SIZE = 60    # Size of bins for heart rate data (larger for smoother HR curves)
+HEART_RATE_BOOST = 0.2      # Factor to boost detection score when heart rate confirms micro-expression
 
 # Face detection parameters for heart rate
 FACE_ROI_SCALE = 0.65       # Scale factor for face ROI
@@ -57,8 +57,8 @@ EVM_PARAMS = {
 
 # Feature weights for detection (PBM/EVM exclusive)
 FEATURE_WEIGHTS = {
-    'phase_change': 3.0,      # Very strong weight for PBM micro-expression features
-    'heart_rate': 0.2,        # Much lower weight for EVM heart rate features 
+    'phase_change': 3.0,      # Strong weight for PBM micro-expression features
+    'heart_rate': 0.3,        # Heart rate weight now 1/10th of phase change weight
     'cross_correlation': 0.0  # No weight for correlation - not using any other technique
 }
 

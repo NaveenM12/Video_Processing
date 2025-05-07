@@ -216,28 +216,84 @@ class DeceptionDetector:
             _, avg_bpm, _ = heart_rate_data
             
             if len(avg_bpm) > 0:
-                # Calculate heart rate changes
+                # Find baseline heart rate (overall average)
+                baseline_bpm = np.mean(avg_bpm)
+                print(f"Baseline heart rate: {baseline_bpm:.2f} BPM")
+                
+                # Apply heart_rate_bin_size to flatten BPM values across bins
+                # This is critical for proper binning of heart rate data
+                bin_size = self.params['heart_rate_bin_size']
+                print(f"Using heart rate bin size of {bin_size} frames for BPM flattening")
+                
+                # Create binned/flattened BPM array
+                flattened_bpm = np.zeros_like(avg_bpm)
+                num_bins = max(1, int(np.ceil(len(avg_bpm) / bin_size)))
+                
+                # Calculate average BPM for each bin and apply it to all frames in that bin
+                for bin_idx in range(num_bins):
+                    bin_start = bin_idx * bin_size
+                    bin_end = min(len(avg_bpm), bin_start + bin_size)
+                    
+                    if bin_end > bin_start:
+                        # Calculate bin average (only for frames with valid data)
+                        bin_values = avg_bpm[bin_start:bin_end]
+                        valid_values = bin_values[bin_values > 0]
+                        
+                        if len(valid_values) > 0:
+                            bin_avg = np.mean(valid_values)
+                            # Apply the same average to all frames in this bin
+                            flattened_bpm[bin_start:bin_end] = bin_avg
+                
+                # Print some statistics about the flattened heart rate
+                print(f"Original BPM range: {np.min(avg_bpm[avg_bpm > 0]):.2f} - {np.max(avg_bpm):.2f} BPM")
+                print(f"Flattened BPM range: {np.min(flattened_bpm[flattened_bpm > 0]):.2f} - {np.max(flattened_bpm):.2f} BPM")
+                
+                # Replace the original avg_bpm with the flattened version
+                # This ensures all downstream calculations use the binned values
+                avg_bpm = flattened_bpm
+                
+                # Calculate heart rate metrics for each window
+                # Use a longer window (60 frames) for heart rate, independent of the PBM window size
+                hr_window_size = 60  # Extended window for heart rate analysis only
+                
                 for window in self.windows:
-                    # Extract window boundaries
-                    start_frame = window['start_frame']
-                    end_frame = window['end_frame']
+                    # Extract original window boundaries (keep these unchanged for deception detection)
+                    center_frame = window['center_frame']
+                    
+                    # Calculate extended heart rate window centered on the same frame
+                    # This only affects the heart rate calculation, not the deception window size
+                    hr_start_frame = max(0, center_frame - hr_window_size//2)
+                    hr_end_frame = min(len(avg_bpm)-1, center_frame + hr_window_size//2)
                     
                     # Skip if outside heart rate data range
-                    if end_frame >= len(avg_bpm) or start_frame >= len(avg_bpm):
+                    if hr_end_frame >= len(avg_bpm) or hr_start_frame >= len(avg_bpm):
                         continue
                     
-                    # Get heart rate data for this window
-                    window_hr = avg_bpm[start_frame:end_frame+1]
+                    # Get heart rate data for this extended window
+                    window_hr = avg_bpm[hr_start_frame:hr_end_frame+1]
                     
                     if len(window_hr) > 1:
-                        # Calculate heart rate variability in this window
-                        hr_std = np.std(window_hr)
-                        hr_change = np.max(window_hr) - np.min(window_hr)
-                        hr_diff = np.diff(window_hr)
-                        hr_max_change = np.max(np.abs(hr_diff)) if len(hr_diff) > 0 else 0
+                        # Calculate window-level heart rate metrics over the extended window
+                        window_avg_bpm = np.mean(window_hr)  # Average BPM for the entire window
+                        window_max_bpm = np.max(window_hr)   # Maximum BPM in the window
                         
-                        # Store heart rate change metric
-                        window['heart_rate_change'] = max(hr_std, hr_max_change)
+                        # Calculate deviation from baseline
+                        bpm_deviation = window_avg_bpm - baseline_bpm
+                        bpm_percent_change = (bpm_deviation / baseline_bpm) * 100 if baseline_bpm > 0 else 0
+                        
+                        # Store heart rate metrics (unchanged window boundaries for detection)
+                        window['hr_avg'] = window_avg_bpm
+                        window['hr_max'] = window_max_bpm
+                        window['hr_deviation'] = bpm_deviation
+                        window['hr_percent_change'] = bpm_percent_change
+                        
+                        # Calculate heart rate score - higher for significant deviations
+                        # Use absolute deviation to capture both increases and decreases
+                        window['heart_rate_change'] = abs(bpm_percent_change) / 10.0  # Scale to reasonable range
+                        
+                        # Debug output for significant heart rate changes (using original window for labeling)
+                        if abs(bpm_percent_change) > 5.0:
+                            print(f"Window at frame {window['center_frame']}: {abs(bpm_percent_change):.2f}% BPM change over {len(window_hr)} frames")
         
         # STEP 6: Calculate deception scores
         # Now create a completely transparent scoring function focused on PBM peaks
@@ -250,7 +306,7 @@ class DeceptionDetector:
             # Sort peak regions by:
             # 1. Peak count (most important - more peaks means stronger evidence)
             # 2. Peak density (second - clustered peaks are more significant)
-            # 3. Heart rate change (tertiary - only as confirmation)
+            # 3. Heart rate change (now a more significant factor)
             for window in self.peak_regions:
                 # Calculate final deception score with clear weighting
                 pbm_weight = self.params['feature_weights']['phase_change']
@@ -260,26 +316,42 @@ class DeceptionDetector:
                 peak_score = window['pbm_peaks'] * pbm_weight
                 
                 # Add density bonus for clustered peaks
-                density_bonus = window['pbm_peak_density'] * 0.1 * pbm_weight
+                density_bonus = window['pbm_peak_density'] * 0.2 * pbm_weight
                 
-                # Add small heart rate confirmation bonus if available
-                hr_bonus = window['heart_rate_change'] * hr_weight * 0.1
+                # Add heart rate factor - now more significant (no longer divided by 0.1)
+                hr_score = window.get('heart_rate_change', 0) * hr_weight
                 
                 # Calculate final transparent score
-                window['deception_score'] = peak_score + density_bonus + hr_bonus
+                window['deception_score'] = peak_score + density_bonus + hr_score
+                
+                # Store component scores for transparency
+                window['pbm_score'] = peak_score
+                window['density_score'] = density_bonus
+                window['hr_score'] = hr_score
             
             # Sort by deception score
             self.peak_regions.sort(key=lambda w: w['deception_score'], reverse=True)
             
-            # Print top candidates
+            # Print top candidates with detailed score breakdown
             print("\nTop deception window candidates:")
             for i, window in enumerate(self.peak_regions[:3]):
+                pbm_score = window.get('pbm_score', 0)
+                density_score = window.get('density_score', 0)
+                hr_score = window.get('hr_score', 0)
+                total_score = window.get('deception_score', 0)
+                
+                # Calculate percentages of total score
+                pbm_pct = (pbm_score / total_score * 100) if total_score > 0 else 0
+                density_pct = (density_score / total_score * 100) if total_score > 0 else 0
+                hr_pct = (hr_score / total_score * 100) if total_score > 0 else 0
+                
                 print(f"Candidate {i+1}:")
                 print(f"  - Frames: {window['start_frame']}-{window['end_frame']} (center: {window['center_frame']})")
                 print(f"  - Peaks: {window['pbm_peaks']}")
                 print(f"  - Peak density: {window['pbm_peak_density']:.2f}")
-                print(f"  - Heart rate change: {window['heart_rate_change']:.2f}")
-                print(f"  - Deception score: {window['deception_score']:.2f}")
+                print(f"  - Heart rate: {window.get('hr_avg', 0):.2f} BPM ({window.get('hr_percent_change', 0):.2f}% change)")
+                print(f"  - Score breakdown: PBM: {pbm_score:.2f} ({pbm_pct:.1f}%), Density: {density_score:.2f} ({density_pct:.1f}%), Heart rate: {hr_score:.2f} ({hr_pct:.1f}%)")
+                print(f"  - Total score: {total_score:.2f}")
             
             # Select the top peak region as the deception window
             top_window = self.peak_regions[0]
@@ -293,11 +365,15 @@ class DeceptionDetector:
                 'duration': (top_window['end_frame'] - top_window['start_frame']) / self.fps
             }
             
+            # Print selected window with more details
             print(f"\nSELECTED DECEPTION WINDOW:")
             print(f"  - Frames: {top_window['start_frame']}-{top_window['end_frame']} (center: {top_window['center_frame']})")
             print(f"  - {top_window['pbm_peaks']} micro-expression peaks detected")
+            print(f"  - Heart rate: {top_window.get('hr_avg', 0):.2f} BPM ({top_window.get('hr_percent_change', 0):.2f}% from baseline)")
             print(f"  - Duration: {top_window['time_info']['duration']:.2f}s")
-            print(f"  - Deception score: {top_window['deception_score']:.2f}")
+            print(f"  - PBM contribution: {(top_window.get('pbm_score', 0) / top_window.get('deception_score', 1) * 100):.1f}%")
+            print(f"  - HR contribution: {(top_window.get('hr_score', 0) / top_window.get('deception_score', 1) * 100):.1f}%")
+            print(f"  - Total score: {top_window.get('deception_score', 0):.2f}")
         else:
             print("No windows with significant micro-expression peaks found")
             self.deception_windows = []
@@ -422,6 +498,7 @@ class DeceptionDetector:
             frame_centers = [w['center_frame'] for w in self.windows]
             times = [frame / self.fps for frame in frame_centers]
             peak_counts = [w.get('pbm_peaks', 0) for w in self.windows]
+            hr_percentages = [w.get('hr_percent_change', 0) for w in self.windows]
             scores = []
             
             # Normalize scores for visualization
@@ -435,32 +512,47 @@ class DeceptionDetector:
             current_time = frame_idx / self.fps
             ax.axvline(x=current_time, color='green', linestyle='-', linewidth=3, label='Current time')
             
-            # Plot the scores using a color gradient
+            # Plot the main score line with color gradient
             cmap = LinearSegmentedColormap.from_list("custom", [(0, 'green'), (0.5, 'yellow'), (1, 'red')])
             sc = ax.scatter(times, scores, c=scores, cmap=cmap, s=80, alpha=0.8, label='Deception score')
             
             # Connect points with a line for better visualization
             ax.plot(times, scores, '-', color='#888888', alpha=0.3, linewidth=1.5)
             
-            # Mark windows with significant peaks using diamond markers
+            # Identify windows with significant peaks (2+ peaks) and heart rate changes
             peak_times = []
             peak_scores = []
+            hr_times = []
+            hr_scores = []
             
-            for i, count in enumerate(peak_counts):
-                # Mark windows with 2+ peaks (matches min_peaks_required default)
-                if count >= 2:
-                    peak_times.append(times[i])
-                    peak_scores.append(scores[i])
+            for i, (count, hr_pct) in enumerate(zip(peak_counts, hr_percentages)):
+                # Add text showing component contribution
+                if scores[i] > 0.3:  # Only add labels for higher-scoring windows to avoid clutter
+                    # Add peak count label if significant
+                    if count >= 2:
+                        peak_times.append(times[i])
+                        peak_scores.append(scores[i])
+                        ax.text(times[i], scores[i] + 0.07, f"{count} peaks", 
+                              ha='center', va='bottom', fontsize=10, fontweight='bold',
+                              bbox=dict(boxstyle='round', facecolor='white', alpha=0.7, edgecolor='none'))
                     
-                    # Add text label showing exact peak count
-                    ax.text(times[i], scores[i] + 0.05, f"{count}", 
-                           ha='center', va='bottom', fontsize=12, fontweight='bold',
-                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.7, edgecolor='none'))
+                    # Add heart rate label if significant
+                    if abs(hr_pct) >= 5.0:
+                        hr_times.append(times[i])
+                        hr_scores.append(scores[i])
+                        ax.text(times[i], scores[i] - 0.07, f"{hr_pct:.1f}% HR", 
+                              ha='center', va='top', fontsize=10, fontweight='bold',
+                              color='blue', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7, edgecolor='none'))
             
             # Plot diamond markers for windows with significant peaks
             if peak_times:
                 ax.scatter(peak_times, peak_scores, color='yellow', marker='D', s=160, 
                           edgecolor='black', linewidth=1.5, alpha=0.9, label='Significant peaks')
+            
+            # Plot triangle markers for windows with significant heart rate changes
+            if hr_times:
+                ax.scatter(hr_times, hr_scores, color='cyan', marker='^', s=140, 
+                          edgecolor='blue', linewidth=1.5, alpha=0.8, label='Significant HR change')
             
             # Highlight the selected deception region with a RED rectangle
             if self.deception_windows:
@@ -474,13 +566,20 @@ class DeceptionDetector:
                                             color='red', alpha=0.5, label='Deception region')
                         ax.add_patch(rect)
                         
-                        # Get peak count and add a label
+                        # Get component contributions for the label
                         peak_count = window.get('pbm_peaks', 0)
-                        if peak_count > 0:
-                            ax.text((start_time + end_time) / 2, 0.7, f"{peak_count} peaks", 
-                                   ha='center', va='center', fontsize=16, fontweight='bold',
-                                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, 
-                                            edgecolor='red', linewidth=2))
+                        hr_change = window.get('hr_percent_change', 0)
+                        
+                        # Create a detailed label with both PBM and HR info
+                        label_text = f"{peak_count} peaks"
+                        if abs(hr_change) >= 1.0:
+                            label_text += f", {hr_change:.1f}% HR"
+                            
+                        # Add the label to the deception region
+                        ax.text((start_time + end_time) / 2, 0.7, label_text, 
+                               ha='center', va='center', fontsize=16, fontweight='bold',
+                               bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, 
+                                       edgecolor='red', linewidth=2))
             
             # Configure plot appearance
             ax.set_xlabel('Time (seconds)', fontsize=14)
@@ -491,14 +590,13 @@ class DeceptionDetector:
             ax.grid(True, alpha=0.3)
             ax.tick_params(axis='both', which='major', labelsize=12)
             
-            # Create custom legend
+            # Create custom legend with better descriptions
             legend_elements = [
                 Line2D([0], [0], color='green', lw=3, label='Current time'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, label='Low score'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='yellow', markersize=10, label='Medium score'),
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='High score'),
-                Line2D([0], [0], marker='D', color='w', markerfacecolor='yellow', markersize=10, label='Significant peaks'),
-                plt.Rectangle((0, 0), 1, 1, color='red', alpha=0.5, label='Deception region')
+                Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='High deception score'),
+                Line2D([0], [0], marker='D', color='w', markerfacecolor='yellow', markersize=10, label='Significant micro-expressions'),
+                Line2D([0], [0], marker='^', color='w', markerfacecolor='cyan', markersize=10, label='Heart rate deviation'),
+                plt.Rectangle((0, 0), 1, 1, color='red', alpha=0.5, label='Detected deception region')
             ]
             
             # Add the legend

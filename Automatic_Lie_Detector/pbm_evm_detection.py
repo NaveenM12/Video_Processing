@@ -55,6 +55,7 @@ from Automatic_Lie_Detector.deception_config import (
     PBM_PARAMS,
     EVM_PARAMS,
     FEATURE_WEIGHTS,
+    HEART_RATE_BIN_SIZE,
     get_config
 )
 
@@ -72,6 +73,9 @@ DETECTION_PARAMS = {
     # Anomaly detection parameters
     'anomaly_threshold': 95,       # Percentile threshold for anomaly detection
     'min_anomaly_score': 0.7,      # Minimum anomaly score to consider
+    
+    # Heart rate parameters
+    'heart_rate_bin_size': HEART_RATE_BIN_SIZE,  # Size of bins for heart rate analysis (frames)
     
     # Feature weighting - ONLY use phase change for motion (PBM) and heart rate for physiological (EVM)
     'feature_weights': FEATURE_WEIGHTS,
@@ -106,6 +110,9 @@ class PBMEVMDetector(AutomaticLieDetector):
         
         # Call parent initialization
         super().__init__(motion_params, color_params)
+        
+        # Store the heart rate bin size parameter for use in BPM calculations
+        self.params = get_config()
         
         # Override detector with specialized detection parameters
         self.detector = DeceptionDetector(DETECTION_PARAMS)
@@ -349,9 +356,43 @@ class PBMEVMDetector(AutomaticLieDetector):
             if valid_right_frames:
                 color_signals['right_cheek'] = self.processor.calculate_color_changes(valid_right_frames)
             
-            # Calculate heart rate data
+            # Calculate heart rate data - but don't pass the heart_rate_bin_size parameter yet
+            # The original error shows we're actually using SideBySideMagnification's method
+            # which doesn't accept this parameter
             if color_signals:
+                heart_rate_bin_size = self.params['heart_rate_bin_size']
+                print(f"Using heart rate bin size of {heart_rate_bin_size} frames for BPM calculation")
+                
+                # Get regular heart rate data first
                 heart_rate_data = self.processor.calculate_bpm(color_signals, fps=fps)
+                
+                if heart_rate_data is not None:
+                    # Now manually apply the binning to the avg_bpm data
+                    inst_bpm, avg_bpm, signal = heart_rate_data
+                    
+                    # Create binned/flattened BPM array
+                    flattened_bpm = np.zeros_like(avg_bpm)
+                    num_bins = max(1, int(np.ceil(len(avg_bpm) / heart_rate_bin_size)))
+                    
+                    # Calculate average BPM for each bin and apply it to all frames in that bin
+                    for bin_idx in range(num_bins):
+                        bin_start = bin_idx * heart_rate_bin_size
+                        bin_end = min(len(avg_bpm), bin_start + heart_rate_bin_size)
+                        
+                        if bin_end > bin_start:
+                            # Calculate bin average (only for frames with valid data)
+                            bin_values = avg_bpm[bin_start:bin_end]
+                            valid_values = bin_values[bin_values > 0]
+                            
+                            if len(valid_values) > 0:
+                                bin_avg = np.mean(valid_values)
+                                # Apply the same average to all frames in this bin
+                                flattened_bpm[bin_start:bin_end] = bin_avg
+                    
+                    # Replace the original avg_bpm with our flattened version
+                    # and create a new heart_rate_data tuple
+                    heart_rate_data = (inst_bpm, flattened_bpm, signal)
+                    
                 print(f"Extracted heart rate data with {len(heart_rate_data[1])} points")
         except Exception as e:
             print(f"Warning: Failed to extract heart rate data: {str(e)}")
@@ -423,7 +464,7 @@ class PBMEVMDetector(AutomaticLieDetector):
                     heart_rate_data, frame_idx, plot_width, plot_height
                 )
                 heart_plot = self.detector.highlight_deception_regions(heart_plot, frame_idx)
-                heart_title = "Heart Rate Estimation"
+                heart_title = f"Heart Rate Estimation (Bin Size: {self.params['heart_rate_bin_size']} frames)"
                 # Add title to heart rate plot if not already present - make larger and more visible
                 cv2.putText(heart_plot, heart_title, (plot_width//10, 40), 
                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
