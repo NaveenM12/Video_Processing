@@ -30,7 +30,7 @@ MAX_WINDOW_SPAN = 90        # Maximum size of the detection window (in frames)
 DEFAULT_SPAN_IN_BINS = 6     # Number of bins to use around the most significant bin
 
 # Heart rate analysis parameters
-HEART_RATE_BIN_SIZE = 45    # Size of bins for heart rate data (larger for smoother HR curves)
+HEART_RATE_BIN_SIZE = 30    # Size of bins for heart rate data (larger for smoother HR curves)
 
 # Face detection parameters for heart rate
 FACE_ROI_SCALE = 0.65       # Scale factor for face ROI
@@ -48,17 +48,17 @@ PBM_PARAMS = {
 # EVM parameters (Eulerian Video Magnification for heart rate detection)
 # Matching parameters from config.py COLOR_MAG_PARAMS with reduced alpha
 EVM_PARAMS = {
-    'alpha': 30.0,            # Reduced amplification factor for more subtle magnification
+    'alpha': 40.0,            # Slightly increased amplification factor for better redness visibility
     'level': 5,               # Pyramid level
     'f_lo': 50/60,            # Low cutoff frequency (50 BPM)
     'f_hi': 180/60,           # High cutoff frequency (180 BPM)
-    'chromAttenuation': 1.0   # Add chroma attenuation to reduce color artifacts
+    'chromAttenuation': 0.9   # Slightly reduced to enhance redness while avoiding artifacts
 }
 
 # Feature weights for detection (PBM/EVM exclusive)
 FEATURE_WEIGHTS = {
     'phase_change': 3.0,      # Strong weight for PBM micro-expression features
-    'heart_rate': 1.0,        # Weight for heart rate changes detected via EVM (1/3rd of phase change weight)
+    'heart_rate': 1.0,        # Weight for heart rate changes detected via EVM (1/2 of phase change weight)
     'cross_correlation': 0.0  # No weight for correlation - not using any other technique
 }
 
