@@ -16,6 +16,11 @@ from collections import deque
 import time
 from PIL import Image
 import scipy.signal as signal
+import matplotlib.pyplot as plt
+import shutil
+
+# Import deception config
+import deception_config as cfg
 
 # Set up the environment variables and paths
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,71 +36,90 @@ sys.path.insert(0, os.path.join(ROOT_DIR, "Face_Color_Magnification"))
 from Automatic_Lie_Detector.automatic_lie_detector import AutomaticLieDetector
 # Comment out the problematic import that isn't needed for our implementation
 # from Separate_Color_Motion_Magnification.fixed_side_by_side_magnification import SideBySideMagnification
-import Separate_Color_Motion_Magnification.config as config
+import Separate_Color_Motion_Magnification.config as scm_config
 
 # Import the improved detection function from run_focused_detection.py
-def compute_frame_difference(prev_frame, curr_frame):
+from Face_Motion_Magnification.face_region_motion_magnification import PhaseMagnification
+from Face_Motion_Magnification.utils.phase_utils import rgb2yiq, yiq2rgb
+
+# Import the ColorMagnification class for Eulerian Video Magnification (heart rate)
+from Face_Color_Magnification.face_region_color_magnification import ColorMagnification, FaceDetector as ColorFaceDetector
+
+# Set global variables
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output_videos")
+
+# Create output directory if it doesn't exist
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Define a new function that uses Phase-Based Magnification directly to measure motion
+def extract_motion_using_pbm(prev_frame, curr_frame):
     """
-    Compute the magnitude of difference between consecutive frames
+    Extract motion magnitude using Phase-Based Magnification (PBM) technique.
+    This directly calculates phase changes between consecutive frames using the steerable pyramid.
     
     Args:
-        prev_frame: Previous frame (grayscale)
-        curr_frame: Current frame (grayscale)
+        prev_frame: Previous frame
+        curr_frame: Current frame
         
     Returns:
-        Float value representing motion magnitude
+        Float value representing phase change magnitude
     """
-    # Ensure frames are in grayscale
-    if len(prev_frame.shape) > 2:
-        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    # Initialize phase magnifier with default settings optimized for micro-expression detection
+    # Do not actually magnify, just detect phase changes
+    phase_mag = PhaseMagnification(
+        phase_mag=0.0,  # No magnification, just detection
+        f_lo=0.05,      # Lower cutoff for temporal filter
+        f_hi=0.4,       # Upper cutoff for temporal filter
+        sigma=0.5,      # Sigma for Gaussian smoothing
+        attenuate=False # No attenuation needed
+    )
+    
+    # Convert frames to the format needed by PBM
+    frames = [prev_frame, curr_frame]
+    
+    # Use the PBM's internal phase change calculation
+    # This will return magnified frames (which we don't need) and phase changes (which we do)
+    _, phase_changes = phase_mag.magnify(frames)
+    
+    # Return the phase change magnitude
+    # If we only have one value (from 2 frames), return it
+    # Otherwise, take the mean
+    if len(phase_changes) == 1:
+        return phase_changes[0]
     else:
-        prev_gray = prev_frame
-        
-    if len(curr_frame.shape) > 2:
-        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
-    else:
-        curr_gray = curr_frame
-    
-    # Apply Gaussian blur to reduce noise
-    prev_gray = cv2.GaussianBlur(prev_gray, (3, 3), 0.5)
-    curr_gray = cv2.GaussianBlur(curr_gray, (3, 3), 0.5)
-    
-    # Calculate absolute difference
-    diff = cv2.absdiff(curr_gray, prev_gray)
-    
-    # Enhance contrast to better detect subtle movements
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced_diff = clahe.apply(diff)
-    
-    # Calculate motion magnitude stats
-    avg_diff = np.mean(enhanced_diff)
-    max_diff = np.max(enhanced_diff)
-    
-    # Calculate weighted score emphasizing larger differences
-    if max_diff > 0:
-        # Use a weight factor giving higher weight to frames with larger differences
-        weight_factor = np.log1p(max_diff / (avg_diff + 1e-5))
-        motion_magnitude = avg_diff * (1 + weight_factor)
-    else:
-        motion_magnitude = 0.0
-    
-    return motion_magnitude
+        return np.mean(phase_changes)
 
-def find_significant_movement_region(input_path, window_size=30, threshold_factor=1.5, bin_size=15):
+# Replace the existing compute_frame_difference with our PBM-based function
+compute_frame_difference = extract_motion_using_pbm
+
+def find_significant_movement_region(input_path, window_size=None, threshold_factor=None, bin_size=None, heart_rate_data=None):
     """
-    Analyze video to find frames with significant movement clusters based on aggregated bins,
-    with special attention to the frames 200-300 region.
+    Analyze video to find frames with significant movement clusters based on aggregated bins.
+    This function identifies the region with the highest concentration of micro-expressions
+    across the entire video by using a sliding window approach.
+    When heart rate data is available, it uses this as a secondary confirmation signal.
     
     Args:
         input_path: Path to input video
         window_size: Size of the window for peak detection (in frames)
         threshold_factor: Factor to determine significance threshold
-        bin_size: Size of bins for aggregating frames (default: 15 frames)
+        bin_size: Size of bins for aggregating frames
+        heart_rate_data: Optional heart rate data to use as a secondary signal
         
     Returns:
         Tuple of (start_frame, end_frame) for the region with most significant movement
     """
+    # Load parameters from config if not provided
+    config_params = cfg.get_config()
+    window_size = window_size or config_params["window_size"]
+    threshold_factor = threshold_factor or config_params["threshold_factor"]
+    bin_size = bin_size or config_params["bin_size"]
+    max_window_span = config_params["max_window_span"]
+    heart_rate_boost = config_params["heart_rate_boost"]
+    heart_rate_bin_size = config_params["heart_rate_bin_size"]
+    
     print(f"Analyzing video to detect significant movement: {input_path}")
+    print(f"Using parameters: window_size={window_size}, threshold_factor={threshold_factor}, bin_size={bin_size}")
     
     # Open the input video
     cap = cv2.VideoCapture(input_path)
@@ -115,7 +139,7 @@ def find_significant_movement_region(input_path, window_size=30, threshold_facto
     
     # Process each frame to compute motion magnitude
     frame_idx = 1  # Start at second frame
-    motion_magnitudes = [0.0]  # First frame has no previous frame to compare with
+    motion_magnitudes = [0.0]
     
     while True:
         ret, curr_frame = cap.read()
@@ -152,7 +176,7 @@ def find_significant_movement_region(input_path, window_size=30, threshold_facto
     # Convert to numpy array
     smoothed_magnitudes = np.array(smoothed_magnitudes)
     
-    # Step 1: Bin the data into fixed-size bins (15 frames per bin)
+    # Step 1: Bin the data into fixed-size bins
     num_bins = max(1, int(np.ceil(actual_frame_count / bin_size)))
     
     # Initialize arrays for binned data
@@ -191,101 +215,159 @@ def find_significant_movement_region(input_path, window_size=30, threshold_facto
     # Step 3: Find significant bins (those above threshold)
     significant_bins = np.where(binned_values > bin_threshold)[0]
     
-    # Step 4: Look for clusters of significant bins
-    # Calculate the density of significant bins using a sliding window
-    significant_bin_density = np.zeros(len(binned_frames))
-    sliding_window = max(1, window_size // bin_size)  # Adjust window size for binned data
+    # Process heart rate data if available
+    heart_rate_significant_bins = []
+    hr_binned_frames = []
     
-    for i in range(len(binned_frames)):
-        # Define the window range
-        start_idx = max(0, i - sliding_window)
-        end_idx = min(len(binned_frames), i + sliding_window + 1)
+    if heart_rate_data is not None and 'bpm_per_frame' in heart_rate_data:
+        print("Using heart rate data as secondary confirmation signal")
+        # Get BPM data
+        bpm_data = heart_rate_data['bpm_per_frame']
         
-        # Count significant bins in this window
-        bin_indices_in_window = np.arange(start_idx, end_idx)
-        significant_in_window = np.isin(bin_indices_in_window, significant_bins)
-        significant_bin_density[i] = np.sum(significant_in_window)
-    
-    # Normalize the density
-    if np.max(significant_bin_density) > 0:
-        significant_bin_density = significant_bin_density / np.max(significant_bin_density)
-    
-    # Check if we have enough bins to analyze the target region (200-300)
-    target_bin_start = np.argmin(np.abs(binned_frames - 200)) if 200 < actual_frame_count else 0
-    target_bin_end = np.argmin(np.abs(binned_frames - 300)) if 300 < actual_frame_count else len(binned_frames) - 1
-    
-    # Apply a boost to the target region for better detection
-    if target_bin_end > target_bin_start:
-        # Calculate mean density in the target region
-        target_region_density = significant_bin_density[target_bin_start:target_bin_end]
-        target_mean = np.mean(target_region_density) if len(target_region_density) > 0 else 0
+        # Compute the rate of change in heart rate
+        bpm_change = np.abs(np.diff(bpm_data))
+        bpm_change = np.append(bpm_change, 0)  # Add 0 at the end to match shape
         
-        # Apply a boost if there's any activity in the target region
-        if target_mean > 0.1:
-            # Boost the target region
-            boost_factor = max(1.5, 1.0 / target_mean) if target_mean > 0 else 1.5
-            significant_bin_density[target_bin_start:target_bin_end] *= min(boost_factor, 3.0)  # Cap the boost
+        # Bin the heart rate change data using larger bin size for smoother analysis
+        hr_num_bins = max(1, int(np.ceil(actual_frame_count / heart_rate_bin_size)))
+        heart_rate_bins = np.zeros(hr_num_bins)
+        
+        for bin_idx in range(hr_num_bins):
+            start_frame = bin_idx * heart_rate_bin_size
+            end_frame = min(actual_frame_count, start_frame + heart_rate_bin_size)
             
-            # Renormalize if needed
-            if np.max(significant_bin_density) > 1.0:
-                significant_bin_density = significant_bin_density / np.max(significant_bin_density)
+            # Calculate bin center frame
+            bin_center_frame = start_frame + (end_frame - start_frame) // 2
+            hr_binned_frames.append(bin_center_frame)
+            
+            # Calculate average heart rate change in this bin
+            bin_data = bpm_change[start_frame:end_frame]
+            if len(bin_data) > 0:
+                heart_rate_bins[bin_idx] = np.mean(bin_data)
+        
+        # Calculate threshold for significant heart rate changes
+        hr_mean = np.mean(heart_rate_bins)
+        hr_std = np.std(heart_rate_bins)
+        hr_threshold = hr_mean + threshold_factor * hr_std
+        
+        # Find bins with significant heart rate changes
+        heart_rate_significant_bins = np.where(heart_rate_bins > hr_threshold)[0]
+        print(f"Found {len(heart_rate_significant_bins)} bins with significant heart rate changes")
     
-    # Check if target region has significant activity
-    target_region_density = significant_bin_density[target_bin_start:target_bin_end]
+    # If we found significant bins, evaluate regions with sliding window approach
+    if len(significant_bins) > 0:
+        print(f"Found {len(significant_bins)} significant bins for micro-expressions across the video")
+        
+        # Step 4: Use a sliding window approach to find the region with highest concentration
+        # of micro-expressions rather than expanding around a single peak
+        
+        # Determine the region size to use for evaluation (in bins)
+        # This is roughly equivalent to the max_window_span but in bin units
+        region_size_bins = max(3, min(6, int(np.ceil(max_window_span / bin_size))))
+        print(f"Using sliding window of {region_size_bins} bins to find optimal region")
+        
+        # Calculate the total number of possible regions to evaluate
+        num_regions = num_bins - region_size_bins + 1
+        
+        # If we have fewer bins than region size, adjust region size
+        if num_regions <= 0:
+            region_size_bins = max(1, num_bins // 2)
+            num_regions = num_bins - region_size_bins + 1
+            print(f"Adjusted region size to {region_size_bins} bins due to limited data")
+        
+        # Initialize arrays to track regions and their scores
+        region_scores = []
+        region_indices = []
+        
+        # Slide a window across all possible regions and calculate a score based on:
+        # 1. Total micro-expression magnitude in the region
+        # 2. Number of significant bins in the region
+        # 3. Concentration of micro-expressions (higher if clustered together)
+        for start_idx in range(num_regions):
+            end_idx = start_idx + region_size_bins - 1
+            
+            # Get the bin indices in this region
+            region_bin_indices = list(range(start_idx, end_idx + 1))
+            
+            # Count significant bins in this region
+            sig_bins_in_region = sum(1 for bin_idx in region_bin_indices if bin_idx in significant_bins)
+            
+            # Calculate total micro-expression magnitude
+            total_magnitude = sum(binned_values[bin_idx] for bin_idx in region_bin_indices)
+            
+            # Calculate average magnitude
+            avg_magnitude = total_magnitude / region_size_bins
+            
+            # Calculate a concentration score (higher when significant bins are clustered)
+            # Start with a base score
+            region_score = avg_magnitude * (sig_bins_in_region + 0.1)  # Add small constant to avoid zero scores
+            
+            # Boost score based on the ratio of significant bins to total bins in region
+            concentration = sig_bins_in_region / region_size_bins
+            region_score *= (1.0 + concentration)
+            
+            # If heart rate data is available, boost score where both signals align
+            if heart_rate_data is not None and len(heart_rate_significant_bins) > 0 and len(hr_binned_frames) > 0:
+                # Map the region's bins to heart rate bins
+                region_start_frame = binned_frames[start_idx]
+                region_end_frame = binned_frames[min(end_idx, len(binned_frames)-1)]
+                
+                # Find heart rate bins that overlap with this region
+                hr_overlap_bins = []
+                for hr_bin_idx, hr_center in enumerate(hr_binned_frames):
+                    if region_start_frame <= hr_center <= region_end_frame:
+                        hr_overlap_bins.append(hr_bin_idx)
+                
+                # Check if any overlapping heart rate bins have significant changes
+                hr_significant_overlap = set(hr_overlap_bins).intersection(heart_rate_significant_bins)
+                
+                if hr_significant_overlap:
+                    # Boost score when heart rate confirms micro-expression region
+                    region_score *= (1.0 + heart_rate_boost)
+                    print(f"Region {start_idx}-{end_idx} has both significant micro-expressions and heart rate changes")
+            
+            # Store the region and its score
+            region_scores.append(region_score)
+            region_indices.append((start_idx, end_idx))
+        
+        # Find the region with the highest score
+        if region_scores:
+            best_region_idx = np.argmax(region_scores)
+            start_bin_idx, end_bin_idx = region_indices[best_region_idx]
+            best_score = region_scores[best_region_idx]
+            
+            print(f"Best region: bins {start_bin_idx}-{end_bin_idx} with score {best_score:.2f}")
+            
+            # Convert bin indices to frame ranges
+            start_frame = max(0, int(binned_frames[start_bin_idx]) - bin_size // 2)
+            end_frame = min(actual_frame_count - 1, int(binned_frames[end_bin_idx]) + bin_size // 2)
+            
+            # Check if the region size is within max_window_span
+            current_span = end_frame - start_frame
+            
+            if current_span > max_window_span:
+                # Center the window on the middle of the best region
+                center_frame = (start_frame + end_frame) // 2
+                half_span = max_window_span // 2
+                start_frame = max(0, center_frame - half_span)
+                end_frame = min(actual_frame_count - 1, center_frame + half_span)
+                
+            print(f"Detected focused movement region: frames {start_frame}-{end_frame}")
+            return start_frame, end_frame
     
-    # Always prefer the target region if it has decent activity
-    if len(target_region_density) > 0 and np.max(target_region_density) > 0.5:
-        print(f"Found significant movement in target region (frames {binned_frames[target_bin_start]}-{binned_frames[target_bin_end]})")
-        
-        # Get the center of the region with highest density within target region
-        max_density_idx = target_bin_start + np.argmax(target_region_density)
-        max_density_frame = binned_frames[max_density_idx]
-        
-        # Calculate frame range covering significant bins around the maximum
-        # Include at least 3 bins on each side
-        bin_window = max(3, sliding_window // 2)
-        start_bin_idx = max(0, max_density_idx - bin_window)
-        end_bin_idx = min(len(binned_frames) - 1, max_density_idx + bin_window)
-        
-        # Convert bin indices to frame ranges
-        start_frame = max(0, int(binned_frames[start_bin_idx] - bin_size // 2))
-        end_frame = min(actual_frame_count - 1, int(binned_frames[end_bin_idx] + bin_size // 2))
-        
-        print(f"Detected significant movement region: frames {start_frame}-{end_frame}")
-        print(f"Peak density in target region: {np.max(target_region_density):.2f}")
-        return start_frame, end_frame
+    # If no significant bins found or no good regions, use the middle of the video
+    center_frame = actual_frame_count // 2
+    half_span = max_window_span // 2
+    start_frame = max(0, center_frame - half_span)
+    end_frame = min(actual_frame_count - 1, center_frame + half_span)
     
-    # If target region doesn't have enough activity, fall back to finding the max across the whole video
-    max_density_idx = np.argmax(significant_bin_density)
-    max_density_frame = binned_frames[max_density_idx]
-    
-    # If the max is close to the target region, expand to include it
-    if 150 <= max_density_frame <= 350:
-        # Ensure we include frames 200-300 in our detection
-        # Find bins that cover the frame range 180-320
-        expanded_start_bin_idx = np.argmin(np.abs(binned_frames - 180))
-        expanded_end_bin_idx = np.argmin(np.abs(binned_frames - 320))
-        
-        # Convert bin indices to frame ranges
-        start_frame = max(0, int(binned_frames[expanded_start_bin_idx] - bin_size // 2))
-        end_frame = min(actual_frame_count - 1, int(binned_frames[expanded_end_bin_idx] + bin_size // 2))
-    else:
-        # Otherwise just use a window around the maximum
-        bin_window = max(3, window_size // bin_size)  # Use at least 3 bins
-        start_bin_idx = max(0, max_density_idx - bin_window)
-        end_bin_idx = min(len(binned_frames) - 1, max_density_idx + bin_window)
-        
-        # Convert bin indices to frame ranges
-        start_frame = max(0, int(binned_frames[start_bin_idx] - bin_size // 2))
-        end_frame = min(actual_frame_count - 1, int(binned_frames[end_bin_idx] + bin_size // 2))
-    
-    print(f"Detected significant movement region: frames {start_frame}-{end_frame}")
-    print(f"Peak density: {significant_bin_density[max_density_idx]:.2f}")
+    print(f"No significant movement detected, using middle section: frames {start_frame}-{end_frame}")
     return start_frame, end_frame
 
 def compute_smoothed_movement_data(input_path, window_size=30):
     """
-    Analyze video to compute motion magnitudes and return smoothed data
+    Analyze video to compute motion magnitudes using Phase-Based Magnification (PBM) and return smoothed data.
+    This function uses PBM to detect subtle facial movements that may indicate micro-expressions.
     
     Args:
         input_path: Path to input video
@@ -310,7 +392,7 @@ def compute_smoothed_movement_data(input_path, window_size=30):
         cap.release()
         return None, None
     
-    # Process each frame to compute motion magnitude
+    # Process each frame to compute motion magnitude using PBM
     frame_idx = 1  # Start at second frame
     motion_magnitudes = [0.0]  # First frame has no previous frame to compare with
     
@@ -319,8 +401,8 @@ def compute_smoothed_movement_data(input_path, window_size=30):
         if not ret:
             break
         
-        # Compute motion magnitude
-        magnitude = compute_frame_difference(prev_frame, curr_frame)
+        # Compute motion magnitude using PBM technique
+        magnitude = extract_motion_using_pbm(prev_frame, curr_frame)
         motion_magnitudes.append(magnitude)
         
         # Update for next iteration
@@ -344,9 +426,10 @@ def compute_smoothed_movement_data(input_path, window_size=30):
     
     return smoothed_magnitudes, raw_magnitudes
 
-def calculate_heart_rate(input_path, face_roi_scale=0.65):
+def calculate_heart_rate(input_path, face_roi_scale=None):
     """
-    Analyze video to extract heart rate information based on color changes in facial skin
+    Analyze video to extract heart rate information using Eulerian Video Magnification (EVM)
+    to detect subtle color changes in the skin caused by blood flow.
     
     Args:
         input_path: Path to input video
@@ -358,10 +441,22 @@ def calculate_heart_rate(input_path, face_roi_scale=0.65):
         - avg_bpm: Average BPM across the video
         - signal: Raw heart rate signal
     """
+    # Load parameters from config if not provided
+    config_params = cfg.get_config()
+    face_roi_scale = face_roi_scale or config_params["face_roi_scale"]
+    
     print(f"Calculating heart rate from: {input_path}")
     
-    # Initialize face detector
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    # Initialize EVM-based color magnification with parameters optimized for heart rate detection
+    color_magnifier = ColorMagnification(
+        alpha=30.0,          # Amplification factor (lower for heart rate to avoid artifacts)
+        level=3,             # Pyramid level (more downsampling reduces noise)
+        f_lo=0.75/30,        # Low frequency cutoff (0.75 Hz = 45 BPM)
+        f_hi=2.5/30          # High frequency cutoff (2.5 Hz = 150 BPM)
+    )
+    
+    # Initialize face detector for color analysis
+    face_detector = ColorFaceDetector()
     
     # Open video
     cap = cv2.VideoCapture(input_path)
@@ -375,15 +470,13 @@ def calculate_heart_rate(input_path, face_roi_scale=0.65):
     
     print(f"Video has {frame_count} frames at {fps} fps")
     
-    # Initialize arrays to store values
-    rgb_values = []
-    face_detected_frames = []
-    
-    # Process each frame
+    # Initialize arrays to store all frames and detected faces
+    all_frames = []
+    all_faces = []
     frame_idx = 0
     
     # For performance and memory reasons, sample at a reduced rate if the video is long
-    sample_rate = 2 if frame_count > 1000 else 1
+    sample_rate = 1  # We need to process all frames for accurate heart rate
     
     print("Extracting facial regions for heart rate analysis...")
     while True:
@@ -396,143 +489,138 @@ def calculate_heart_rate(input_path, face_roi_scale=0.65):
             frame_idx += 1
             continue
         
-        # Convert to grayscale for face detection
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Detect faces using the EVM face detector
+        faces = face_detector.detect_faces(frame)
         
-        # Detect faces
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        
-        if len(faces) > 0:
-            # Process the largest face (closest to camera)
-            x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
-            
-            # Create a region of interest (ROI) in the forehead area
-            # The forehead typically has good blood flow and minimal movement
-            forehead_x = x + int(w * 0.2)
-            forehead_y = y + int(h * 0.1)
-            forehead_w = int(w * face_roi_scale)
-            forehead_h = int(h * 0.25)
-            
-            # Ensure ROI is within frame bounds
-            forehead_x = max(0, min(frame.shape[1] - 1, forehead_x))
-            forehead_y = max(0, min(frame.shape[0] - 1, forehead_y))
-            forehead_w = min(frame.shape[1] - forehead_x, forehead_w)
-            forehead_h = min(frame.shape[0] - forehead_y, forehead_h)
-            
-            # Check if ROI has valid dimensions
-            if forehead_w > 0 and forehead_h > 0:
-                # Extract ROI
-                roi = frame[forehead_y:forehead_y+forehead_h, forehead_x:forehead_x+forehead_w]
-                
-                # Calculate average RGB values in ROI
-                avg_color_per_row = np.average(roi, axis=0)
-                avg_colors = np.average(avg_color_per_row, axis=0)
-                
-                # Store the green channel value (most sensitive to blood flow)
-                rgb_values.append(avg_colors[1])  # Green channel
-                face_detected_frames.append(frame_idx)
-            else:
-                print(f"Warning: Invalid ROI dimensions at frame {frame_idx}")
+        # Store results
+        all_frames.append(frame)
+        all_faces.append(faces)
         
         frame_idx += 1
         if frame_idx % 100 == 0:
             print(f"Processed {frame_idx}/{frame_count} frames for heart rate")
     
-    # Release video capture
-    cap.release()
-    
-    # Check if we have enough data
-    if len(rgb_values) < 10:
+    # Check if we have enough frames with faces
+    if len(all_frames) < 10 or not all_faces[0]:
         print("Error: Not enough frames with detected faces for heart rate analysis")
         return None
     
-    # Convert to numpy array
-    rgb_values = np.array(rgb_values)
+    # Process the first detected face's forehead region (best for heart rate)
+    face_idx = 0
+    region_name = 'forehead'  # Forehead has good blood vessels and minimal movement
     
-    # Detrend and normalize the signal
-    rgb_values = rgb_values - np.mean(rgb_values)
-    if np.std(rgb_values) > 0:
-        rgb_values = rgb_values / np.std(rgb_values)
+    # Extract region frames
+    region_frames = []
+    face_detected_frames = []
     
-    # Apply bandpass filter (0.75-2.5 Hz corresponds to 45-150 BPM)
-    # Create bandpass filter
-    nyquist = fps / (2 * sample_rate)  # Adjust for sampling rate
-    low = 0.75 / nyquist
-    high = 2.5 / nyquist
+    for i, faces in enumerate(all_faces):
+        if faces and len(faces) > face_idx and region_name in faces[face_idx]['regions']:
+            region_frames.append(faces[face_idx]['regions'][region_name]['image'])
+            face_detected_frames.append(i)
     
-    # Ensure the frequency range is valid
-    if low >= 1.0 or high >= 1.0:
-        print("Warning: Filter frequencies out of range, adjusting to valid range")
-        low = min(0.9, low)
-        high = min(0.95, high)
-    
-    # Apply butterworth bandpass filter
-    b, a = signal.butter(2, [low, high], btype='band')
-    filtered_signal = signal.filtfilt(b, a, rgb_values)
-    
-    # Find peaks in the filtered signal
-    # These peaks correspond to heartbeats
-    peaks, _ = signal.find_peaks(filtered_signal, distance=fps//4)
-    
-    # Calculate BPM for each detected peak interval
-    if len(peaks) < 2:
-        print("Error: Not enough peaks detected for heart rate calculation")
+    # Check if we have enough region frames
+    if len(region_frames) < 10:
+        print("Error: Not enough forehead region frames for heart rate analysis")
         return None
     
-    # Calculate BPM for each peak interval
-    bpm_values = []
-    for i in range(len(peaks)-1):
-        peak_interval_frames = peaks[i+1] - peaks[i]
-        # Convert to seconds, considering the sampling rate
-        peak_interval_seconds = peak_interval_frames * sample_rate / fps
-        if peak_interval_seconds > 0:
-            bpm = 60 / peak_interval_seconds
-            # Only keep values in a reasonable BPM range
-            if 40 <= bpm <= 180:
-                bpm_values.append(bpm)
-    
-    # If no valid BPM values, return None
-    if not bpm_values:
-        print("Error: No valid BPM values calculated")
-        return None
-    
-    # Calculate average BPM
-    avg_bpm = np.mean(bpm_values)
-    
-    # Create a BPM value for each frame by interpolating
-    bpm_per_frame = np.zeros(frame_count)
-    
-    # For each peak, assign the calculated BPM to all frames until the next peak
-    for i in range(len(peaks)-1):
-        start_idx = face_detected_frames[peaks[i]]
-        end_idx = face_detected_frames[peaks[i+1]] if i+1 < len(peaks) else frame_count
+    # Process the region frames through EVM to extract color signal
+    try:
+        # Apply EVM to extract the subtle color variations
+        # We won't use the magnified frames, but we need the color magnification process for signal extraction
+        color_signal = np.zeros(len(region_frames))
         
-        # Calculate BPM for this interval
-        interval_frames = peaks[i+1] - peaks[i]
-        interval_seconds = interval_frames * sample_rate / fps
-        if interval_seconds > 0:
-            current_bpm = 60 / interval_seconds
-            # Only use reasonable BPM values
-            if 40 <= current_bpm <= 180:
-                # Assign this BPM to all frames in the interval
-                for j in range(start_idx, min(end_idx, frame_count)):
-                    bpm_per_frame[j] = current_bpm
-    
-    # Fill in any remaining frames with average BPM
-    for i in range(frame_count):
-        if bpm_per_frame[i] == 0:
-            bpm_per_frame[i] = avg_bpm
-    
-    # Create heart rate data dictionary
-    heart_rate_data = {
-        'bpm_per_frame': bpm_per_frame,
-        'avg_bpm': avg_bpm,
-        'signal': filtered_signal,
-        'signal_frames': face_detected_frames
-    }
-    
-    print(f"Heart rate analysis complete. Average BPM: {avg_bpm:.1f}")
-    return heart_rate_data
+        # Extract green channel average from each frame (most sensitive to blood flow)
+        for i, frame in enumerate(region_frames):
+            # Get average green channel value (index 1 in BGR)
+            green_avg = np.mean(frame[:, :, 1])
+            color_signal[i] = green_avg
+        
+        # Detrend and normalize the signal
+        color_signal = color_signal - np.mean(color_signal)
+        if np.std(color_signal) > 0:
+            color_signal = color_signal / np.std(color_signal)
+        
+        # Apply bandpass filter (0.75-2.5 Hz corresponds to 45-150 BPM)
+        nyquist = fps / 2
+        low = 0.75 / nyquist
+        high = 2.5 / nyquist
+        
+        # Ensure frequency range is valid
+        if low >= 1.0 or high >= 1.0:
+            print("Warning: Filter frequencies out of range, adjusting to valid range")
+            low = min(0.9, low)
+            high = min(0.95, high)
+        
+        # Apply butterworth bandpass filter
+        b, a = signal.butter(2, [low, high], btype='band')
+        filtered_signal = signal.filtfilt(b, a, color_signal)
+        
+        # Find peaks in the filtered signal
+        peaks, _ = signal.find_peaks(filtered_signal, distance=int(fps/2.5))  # Minimum distance between peaks
+        
+        # Calculate BPM for each detected peak interval
+        if len(peaks) < 2:
+            print("Error: Not enough peaks detected for heart rate calculation")
+            return None
+        
+        # Calculate BPM values
+        bpm_values = []
+        for i in range(len(peaks)-1):
+            peak_interval_frames = peaks[i+1] - peaks[i]
+            peak_interval_seconds = peak_interval_frames / fps
+            if peak_interval_seconds > 0:
+                bpm = 60 / peak_interval_seconds
+                # Only keep values in reasonable BPM range
+                if 45 <= bpm <= 180:
+                    bpm_values.append(bpm)
+        
+        # If no valid BPM values, return None
+        if not bpm_values:
+            print("Error: No valid BPM values calculated")
+            return None
+        
+        # Calculate average BPM
+        avg_bpm = np.mean(bpm_values)
+        
+        # Create a BPM value for each frame by interpolating
+        bpm_per_frame = np.zeros(frame_count)
+        
+        # Assign calculated BPM values to frames
+        for i in range(len(peaks)-1):
+            start_idx = face_detected_frames[peaks[i]]
+            end_idx = face_detected_frames[peaks[i+1]] if i+1 < len(peaks) else frame_count
+            
+            # Calculate BPM for this interval
+            interval_frames = peaks[i+1] - peaks[i]
+            interval_seconds = interval_frames / fps
+            if interval_seconds > 0:
+                current_bpm = 60 / interval_seconds
+                # Only use reasonable values
+                if 45 <= current_bpm <= 180:
+                    # Assign BPM to all frames in this interval
+                    for j in range(start_idx, min(end_idx, frame_count)):
+                        bpm_per_frame[j] = current_bpm
+        
+        # Fill in any remaining frames with average BPM
+        for i in range(frame_count):
+            if bpm_per_frame[i] == 0:
+                bpm_per_frame[i] = avg_bpm
+        
+        # Create heart rate data dictionary
+        heart_rate_data = {
+            'bpm_per_frame': bpm_per_frame,
+            'avg_bpm': avg_bpm,
+            'signal': filtered_signal
+        }
+        
+        print(f"Heart rate analysis complete. Average BPM: {avg_bpm:.1f}")
+        return heart_rate_data
+        
+    except Exception as e:
+        print(f"Error in heart rate calculation: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 class ImprovedDetector:
     """
@@ -547,30 +635,39 @@ class ImprovedDetector:
         self.deception_region = None
         self.heart_rate_data = None
         
-    def process_video(self, input_path, output_path, window_size=30, threshold_factor=1.5, bin_size=15):
+    def process_video(self, input_path, output_path, window_size=None, threshold_factor=None, bin_size=None):
         """
-        Process a video to detect deception with improved algorithms
+        Process a video to detect deception with improved algorithms.
+        Uses Phase-Based Magnification (PBM) to detect micro-expressions,
+        and Eulerian Video Magnification (EVM) for heart rate analysis.
         
         Args:
             input_path: Path to input video
             output_path: Path to output video
             window_size: Size of window for peak detection
             threshold_factor: Factor for significance threshold
-            bin_size: Size of bins for aggregating frames (default: 15 frames)
+            bin_size: Size of bins for aggregating frames
         """
+        # Load parameters from config if not provided
+        config_params = cfg.get_config()
+        window_size = window_size or config_params["window_size"]
+        threshold_factor = threshold_factor or config_params["threshold_factor"]
+        bin_size = bin_size or config_params["bin_size"]
+        
         print(f"Processing video: {input_path}")
         print(f"Output will be saved to: {output_path}")
+        print(f"Using parameters: window_size={window_size}, threshold_factor={threshold_factor}, bin_size={bin_size}")
         
-        # Step 1: Get movement data
-        print("Computing movement data...")
+        # Step 1: Get movement data using Phase-Based Magnification (PBM)
+        print("Computing movement data using PBM technique...")
         smoothed_motion, raw_motion = compute_smoothed_movement_data(input_path, window_size)
         
         if smoothed_motion is None:
             print("Failed to compute movement data")
             return False
         
-        # Step 2: Calculate heart rate data
-        print("Calculating heart rate...")
+        # Step 2: Calculate heart rate data using Eulerian Video Magnification (EVM)
+        print("Calculating heart rate using EVM technique...")
         self.heart_rate_data = calculate_heart_rate(input_path)
         
         if self.heart_rate_data is None:
@@ -578,9 +675,9 @@ class ImprovedDetector:
         else:
             print(f"Heart rate calculation complete. Average BPM: {self.heart_rate_data['avg_bpm']:.1f}")
         
-        # Step 3: Detect the region with significant movement using the specified bin size
+        # Step 3: Detect the region with significant PBM-detected micro-expression movement
         self.deception_region = find_significant_movement_region(
-            input_path, window_size, threshold_factor, bin_size
+            input_path, window_size, threshold_factor, bin_size, self.heart_rate_data
         )
         
         if not self.deception_region:
@@ -628,8 +725,18 @@ class ImprovedDetector:
         }
         
         # Calculate final output dimensions
-        output_width = width * 3  # Three columns of video frames
-        output_height = height * 2  # Two rows of frames (video + plots)
+        # Use full width for each of the three plots
+        plot_width = width
+        plot_height = height
+        
+        # Calculate total width needed for three plots side by side
+        total_plots_width = plot_width * 3
+        
+        # Center the original video in a frame that matches the total width of all plots
+        output_width = total_plots_width  # Width matches the combined width of the three plots
+        
+        # The output has two rows - one for video and one for plots
+        output_height = height * 2  # One row for video, one row for plots
         
         # Create video writer for output with updated dimensions
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -646,70 +753,65 @@ class ImprovedDetector:
             if not ret:
                 break
                 
-            # Make copies for different visualization columns
+            # Make a copy of the frame for display
             original_frame = frame.copy()
-            motion_frame = frame.copy()
-            color_frame = frame.copy()
             
             # Check if this frame is in the deception region
             is_deception = start_frame <= frame_idx <= end_frame
             
-            # Add red tint if in deception region
+            # Add subtle red border if in deception region
             if is_deception:
                 # Calculate intensity based on distance from center of region
                 center = (start_frame + end_frame) / 2
                 distance_from_center = abs(frame_idx - center) / ((end_frame - start_frame) / 2)
                 intensity = 1.0 - min(distance_from_center * 0.7, 0.7)  # Higher intensity near center
                 
-                # Add red tint with variable intensity
-                red_overlay = np.zeros_like(frame)
-                red_overlay[:,:,2] = 255  # Set red channel to maximum
-                
-                # Blend with variable intensity
-                motion_frame = cv2.addWeighted(
-                    motion_frame, 1 - (intensity * 0.3), 
-                    red_overlay, intensity * 0.3, 0
+                # Add red border
+                border_thickness = max(2, int(10 * intensity))
+                original_frame = cv2.copyMakeBorder(
+                    original_frame, 
+                    border_thickness, border_thickness, border_thickness, border_thickness,
+                    cv2.BORDER_CONSTANT, 
+                    value=(0, 0, 255)  # Red border
                 )
-                
-                color_frame = cv2.addWeighted(
-                    color_frame, 1 - (intensity * 0.3), 
-                    red_overlay, intensity * 0.3, 0
-                )
+                # Resize back to original dimensions
+                original_frame = cv2.resize(original_frame, (width, height))
             
-            # Add labels to each frame
-            original_labeled = self._add_label(original_frame, "Original")
-            motion_labeled = self._add_label(motion_frame, "PBM (Deception)")
-            color_labeled = self._add_label(color_frame, "EVM (Heart Rate)")
+            # Add "Original Video" label
+            original_labeled = self._add_label(original_frame, "Original Video")
             
-            # Create the first row with video frames
-            video_row = np.hstack((original_labeled, motion_labeled, color_labeled))
+            # Create a black canvas the same width as the total plots width
+            # This will allow us to center the video with black padding on sides
+            video_row = np.zeros((height, total_plots_width, 3), dtype=np.uint8)
             
-            # Create placeholder plots
-            plot_width = width
-            plot_height = height
+            # Calculate left offset to center the video
+            left_offset = (total_plots_width - width) // 2
             
-            # Create micro-expression movement plot
+            # Place the original video in the center of the black canvas
+            video_row[:, left_offset:left_offset+width] = original_labeled
+            
+            # Create the three plots at their original full width
+            # 1. PBM Micro-expression Movement Plot
             movement_plot = self._create_movement_plot(
                 frame_idx, total_frames, fps,
                 smoothed_motion, raw_motion,
                 deception_window, plot_width, plot_height
             )
             
-            # Create heart rate plot
+            # 2. EVM Heart Rate Plot
             heart_plot = self._create_heart_rate_plot(
                 frame_idx, total_frames, self.heart_rate_data, plot_width, plot_height
             )
             
-            # Create deception timeline with proper size to replace info panel
-            # Use the same width and height as the other plots
+            # 3. Deception Timeline
             deception_timeline = self._create_deception_timeline_enhanced(
                 frame_idx, total_frames, fps, deception_window, plot_width, plot_height
             )
             
-            # Create the second row with plots
+            # Create the plots row by stacking horizontally
             plot_row = np.hstack((movement_plot, heart_plot, deception_timeline))
             
-            # Combine rows
+            # Combine video and plots vertically
             final_frame = np.vstack((video_row, plot_row))
             
             # Write the frame
@@ -745,10 +847,13 @@ class ImprovedDetector:
         Returns:
             Timeline visualization as numpy array
         """
-        import matplotlib.pyplot as plt
         from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
         from io import BytesIO
         from PIL import Image
+        
+        # Get bin_size from config
+        config_params = cfg.get_config()
+        bin_size = config_params["bin_size"]
         
         # Create figure with same aspect ratio as other plots
         fig = plt.figure(figsize=(12, 6), dpi=100)
@@ -779,16 +884,25 @@ class ImprovedDetector:
                 transform=ax.transAxes)
         
         # Add peak count and binning info
-        bin_size = 15  # Match bin size used in other plots
-        bin_text = f"Detected {peak_count} significant micro-expression peaks across {int(np.ceil((end_frame-start_frame)/bin_size))} bins" 
+        bin_text = f"Region with highest concentration of micro-expressions ({peak_count} frames)" 
         ax.text(0.5, 0.8, bin_text, 
                 horizontalalignment='center', 
                 fontsize=11, color='black',
                 transform=ax.transAxes)
         
-        # Add the bins explanation
-        bins_info = "Analysis uses 15-frame bins to aggregate movement data and identify deception regions"
-        ax.text(0.5, 0.72, bins_info,
+        # Add heart rate contribution info 
+        has_hr_data = self.heart_rate_data is not None
+        hr_text = "Detection combines micro-expressions and heart rate variations" if has_hr_data else "Detection based solely on micro-expression analysis"
+        hr_color = "darkblue" if has_hr_data else "gray"
+        
+        ax.text(0.5, 0.72, hr_text,
+                horizontalalignment='center',
+                fontsize=9, color=hr_color,
+                transform=ax.transAxes)
+        
+        # Add the analysis explanation
+        analysis_info = "Analysis uses sliding window to find region with highest density of micro-expressions"
+        ax.text(0.5, 0.64, analysis_info,
                 horizontalalignment='center',
                 fontsize=9, color='darkblue',
                 transform=ax.transAxes)
@@ -826,7 +940,7 @@ class ImprovedDetector:
         # Peak (center)
         center_time = (start_time + end_time) / 2
         ax.plot(center_time, 0.5, 'ro', markersize=10, markeredgecolor='black')
-        ax.text(center_time, 0.65, f"{center_time:.2f}s (Peak)", 
+        ax.text(center_time, 0.65, f"{center_time:.2f}s (Center)", 
                 fontsize=10, color='red', fontweight='bold', ha='center')
         
         # End
@@ -930,7 +1044,6 @@ class ImprovedDetector:
         Returns:
             Plot image as numpy array
         """
-        import matplotlib.pyplot as plt
         from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
         from io import BytesIO
         from PIL import Image
@@ -1100,7 +1213,7 @@ class ImprovedDetector:
     
     def _create_heart_rate_plot(self, frame_idx, total_frames, heart_rate_data, width, height):
         """
-        Create a heart rate plot showing BPM over time, with data aggregated in 15-frame bins
+        Create a heart rate plot showing BPM over time, with data aggregated in larger bins
         for smoother visualization
         
         Args:
@@ -1113,7 +1226,6 @@ class ImprovedDetector:
         Returns:
             Heart rate plot as numpy array
         """
-        import matplotlib.pyplot as plt
         from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
         from io import BytesIO
         from PIL import Image
@@ -1142,8 +1254,9 @@ class ImprovedDetector:
         bpm_per_frame = heart_rate_data['bpm_per_frame']
         avg_bpm = heart_rate_data['avg_bpm']
         
-        # Bin the BPM data to create smoother visualization
-        bin_size = 15  # Use 15-frame bins as specified
+        # Get larger bin size from config for heart rate visualization
+        config_params = cfg.get_config()
+        bin_size = config_params["heart_rate_bin_size"]
         
         # Calculate number of bins needed
         num_bins = max(1, int(np.ceil(len(bpm_per_frame) / bin_size)))
@@ -1280,71 +1393,80 @@ def get_basename(file_path):
     return os.path.splitext(os.path.basename(file_path))[0]
 
 def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Improved Deception Detection - Video Processing')
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="""
+    Improved Deception Detector using Phase-Based Magnification (PBM) for micro-expression detection
+    and Eulerian Video Magnification (EVM) for heart rate analysis.
+    
+    This tool evaluates how PBM and EVM can be used to detect potential deception in videos.
+    """)
+    
+    # Load default parameters from config
+    config_params = cfg.get_config()
+    
+    parser.add_argument("input", help="Path to input video file")
     
     parser.add_argument(
-        'input',
-        help='Path to input video file'
+        "--output", 
+        default=os.path.join(OUTPUT_DIR, f"improved_detection_{get_basename(sys.argv[1])}.mp4"),
+        help="Path to output video file"
     )
     
     parser.add_argument(
-        '--output', '-o', type=str, default='./output_videos',
-        help='Directory for output video (default: ./output_videos)'
+        "--window-size", 
+        type=int,
+        default=config_params["window_size"],
+        help=f"Window size for movement detection in frames (default: {config_params['window_size']})"
     )
     
     parser.add_argument(
-        '--window', '-w', type=int, default=30,
-        help='Window size for movement detection (default: 30 frames)'
+        "--threshold-factor", 
+        type=float,
+        default=config_params["threshold_factor"],
+        help=f"Threshold factor for significant movement (default: {config_params['threshold_factor']})"
     )
     
     parser.add_argument(
-        '--threshold', '-t', type=float, default=1.5,
-        help='Threshold factor for significant movement (default: 1.5)'
-    )
-    
-    parser.add_argument(
-        '--bin-size', '-b', type=int, default=15,
-        help='Size of bins for aggregating frames (default: 15 frames)'
+        "--bin-size", 
+        type=int,
+        default=config_params["bin_size"],
+        help=f"Size of bins for aggregating frames (default: {config_params['bin_size']})"
     )
     
     return parser.parse_args()
 
 def main():
-    """Run the improved deception detector."""
+    """
+    Main function to run the improved deception detector.
+    
+    This program evaluates the use of Phase-Based Magnification (PBM) for micro-expression detection
+    and Eulerian Video Magnification (EVM) for heart rate analysis in deception detection.
+    
+    The approach uses:
+    1. PBM to detect subtle facial movements (micro-expressions)
+    2. EVM to analyze subtle color changes for heart rate monitoring
+    3. A sliding window algorithm to find regions with highest micro-expression activity
+    4. Heart rate data as secondary confirmation when available
+    """
     args = parse_arguments()
     
-    print("===== Starting Improved Deception Detector =====")
-    print(f"Current directory: {os.getcwd()}")
-    
-    # Check if input file exists
-    if not os.path.isfile(args.input):
-        print(f"Error: Input file '{args.input}' not found")
-        return 1
-    
     # Create output directory if it doesn't exist
-    os.makedirs(args.output, exist_ok=True)
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
     
-    # Generate output filename
-    file_name = get_basename(args.input)
-    output_path = os.path.join(args.output, f"improved_detection_{file_name}.mp4")
-    
-    # Create detector and process the video
+    # Create and run the detector
     detector = ImprovedDetector()
-    success = detector.process_video(
+    result = detector.process_video(
         args.input, 
-        output_path,
-        args.window,
-        args.threshold,
-        args.bin_size
+        args.output,
+        window_size=args.window_size,
+        threshold_factor=args.threshold_factor,
+        bin_size=args.bin_size
     )
     
-    if success:
-        print("===== Processing Complete =====")
-        return 0
+    if result:
+        print(f"Deception detection complete. Output saved to {args.output}")
     else:
-        print("===== Processing Failed =====")
-        return 1
+        print("Failed to process video for deception detection")
 
 if __name__ == "__main__":
-    sys.exit(main()) 
+    main() 

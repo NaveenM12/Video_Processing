@@ -2,8 +2,8 @@
 """
 Fixed run script for the Automatic Lie Detector.
 
-This script sets the PYTHONPATH environment variable to include all necessary directories
-before importing and running the detector.
+This script evaluates the use of Phase-Based Magnification (PBM) for micro-expression detection
+and Eulerian Video Magnification (EVM) for heart rate analysis in deception detection.
 """
 
 import os
@@ -36,6 +36,10 @@ from Separate_Color_Motion_Magnification.config import (
     FACIAL_REGIONS
 )
 
+# Update labels to be explicit about the technologies being used
+PBM_LABEL = "PBM (Micro-Expression Detection)"
+EVM_LABEL = "EVM (Heart Rate Analysis)"
+
 # Define parameters for the Automatic Lie Detector
 INPUT_VIDEOS_FOLDER = "/Users/naveenmirapuri/VideoProcessing/trimmed_mp4"
 OUTPUT_VIDEOS_FOLDER = "/Users/naveenmirapuri/VideoProcessing/Automatic_Lie_Detector/output_videos"
@@ -52,9 +56,9 @@ DETECTION_PARAMS = {
     
     # Feature weighting
     'feature_weights': {
-        'phase_change': 1.0,       # Weight for micro-expression features
-        'heart_rate': 0.7,         # Weight for heart rate features
-        'cross_correlation': 0.5,  # Weight for correlation between signals
+        'phase_change': 1.0,       # Weight for PBM micro-expression features
+        'heart_rate': 0.5,         # Weight for EVM heart rate features (reduced from 0.7)
+        'cross_correlation': 0.3,  # Weight for correlation between signals (reduced for more focus on PBM)
     },
     
     # Visualization
@@ -77,8 +81,8 @@ config_mod.LABEL_THICKNESS = LABEL_THICKNESS
 config_mod.LABEL_HEIGHT = LABEL_HEIGHT
 config_mod.LABEL_ALPHA = LABEL_ALPHA
 config_mod.ORIGINAL_LABEL = ORIGINAL_LABEL
-config_mod.MOTION_LABEL = MOTION_LABEL
-config_mod.COLOR_LABEL = COLOR_LABEL
+config_mod.MOTION_LABEL = PBM_LABEL  # Updated to PBM label
+config_mod.COLOR_LABEL = EVM_LABEL   # Updated to EVM label
 config_mod.FACIAL_REGIONS = FACIAL_REGIONS
 
 # Replace the config module
@@ -93,7 +97,13 @@ from Automatic_Lie_Detector.automatic_lie_detector import AutomaticLieDetector
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Automatic Lie Detector - Video Processing')
+    parser = argparse.ArgumentParser(description="""
+    Automatic Lie Detector - Evaluating PBM and EVM for Deception Detection
+    
+    This tool evaluates the use of:
+    - Phase-Based Magnification (PBM) for micro-expression detection
+    - Eulerian Video Magnification (EVM) for heart rate analysis
+    """)
     
     parser.add_argument(
         '--input', '-i', type=str, default=INPUT_VIDEOS_FOLDER,
@@ -113,12 +123,16 @@ def parse_arguments():
     return parser.parse_args()
 
 def main():
-    """Run the automatic lie detector."""
+    """
+    Run the automatic lie detector using PBM for micro-expression detection
+    and EVM for heart rate analysis.
+    """
     args = parse_arguments()
     
-    print("===== Starting Automatic Lie Detector with Fixed Path Settings =====")
+    print("===== Starting PBM/EVM-based Lie Detector =====")
     print(f"Current directory: {os.getcwd()}")
-    print(f"DETECTION_PARAMS in config: {hasattr(sys.modules['config'], 'DETECTION_PARAMS')}")
+    print("Using Phase-Based Magnification (PBM) for micro-expression detection")
+    print("Using Eulerian Video Magnification (EVM) for heart rate analysis")
     
     # Create detector instance - directly pass the parameters
     detector = AutomaticLieDetector(
@@ -138,7 +152,7 @@ def main():
         print(f"Processing single video: {args.single}")
         basename = os.path.basename(args.single)
         file_name = os.path.splitext(basename)[0]
-        output_path = os.path.join(args.output, f"deception_detection_{file_name}.mp4")
+        output_path = os.path.join(args.output, f"pbm_evm_detection_{file_name}.mp4")
         
         detector.process_video(args.single, output_path)
     else:
@@ -148,7 +162,7 @@ def main():
         
         detector.process_folder(args.input, args.output)
     
-    print("===== Automatic Lie Detector Complete =====")
+    print("===== PBM/EVM-based Lie Detector Complete =====")
 
 if __name__ == "__main__":
     main() 

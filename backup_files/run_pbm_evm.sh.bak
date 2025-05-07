@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# Script to run the PBM/EVM-only detector on a video
+# This detector ONLY uses PBM for motion analysis and EVM for heart rate analysis
+
+# Verify that an argument was provided
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 [path_to_video]"
+    echo "Example: $0 trimmed_mp4/1.mp4"
+    exit 1
+fi
+
+# Get the absolute path of the script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Change to the script directory
+cd "$SCRIPT_DIR"
+
+# Video path is the first argument
+VIDEO_PATH="$1"
+
+# Run the detector on the specified video
+echo "Running PBM/EVM-ONLY detector on video: $VIDEO_PATH"
+python3 run_pbm_evm_detector.py --single "$VIDEO_PATH"
+
+# Check if the command was successful
+if [ $? -eq 0 ]; then
+    echo "Processing complete. Check the output_videos directory for results."
+else
+    echo "Error processing video. Check the console output for details."
+fi 

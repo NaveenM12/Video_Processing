@@ -1,0 +1,372 @@
+"""
+PBM/EVM Detector module
+
+This module wraps the AutomaticLieDetector to ensure it ONLY uses:
+1. Phase-Based Magnification (PBM) for micro-expression detection
+2. Eulerian Video Magnification (EVM) for heart rate analysis
+"""
+
+import os
+import sys
+import cv2
+import numpy as np
+import time
+from typing import Dict, List, Tuple
+
+# Set up the environment variables and paths
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Add all relevant directories to Python path
+sys.path.insert(0, ROOT_DIR)  # VideoProcessing root
+sys.path.insert(0, os.path.join(ROOT_DIR, "Automatic_Lie_Detector"))
+sys.path.insert(0, os.path.join(ROOT_DIR, "Face_Motion_Magnification"))
+sys.path.insert(0, os.path.join(ROOT_DIR, "Face_Color_Magnification"))
+
+# Import the original detector
+from Automatic_Lie_Detector.automatic_lie_detector import AutomaticLieDetector
+
+# Import direct implementations of PBM and EVM
+from Face_Motion_Magnification.face_region_motion_magnification import PhaseMagnification, FacialPhaseMagnification
+from Face_Color_Magnification.face_region_color_magnification import ColorMagnification
+
+class PBMEVMDetector(AutomaticLieDetector):
+    """
+    A specialized detector that ONLY uses:
+    1. Phase-Based Magnification (PBM) for micro-expression detection
+    2. Eulerian Video Magnification (EVM) for heart rate analysis
+    """
+    
+    def __init__(self, motion_params=None, color_params=None):
+        """
+        Initialize the detector with direct PBM and EVM implementations.
+        
+        Args:
+            motion_params: Parameters for PBM
+            color_params: Parameters for EVM
+        """
+        # Call parent initialization
+        super().__init__(motion_params, color_params)
+        
+        # Override the processor with direct implementations
+        # Initialize PBM directly
+        self.pbm_processor = FacialPhaseMagnification()
+        if motion_params:
+            self.pbm_processor.phase_magnifier.phase_mag = motion_params.get('phase_mag', 15.0)
+            self.pbm_processor.phase_magnifier.f_lo = motion_params.get('f_lo', 0.25)
+            self.pbm_processor.phase_magnifier.f_hi = motion_params.get('f_hi', 0.3)
+            self.pbm_processor.phase_magnifier.sigma = motion_params.get('sigma', 1.0)
+            self.pbm_processor.phase_magnifier.attenuate = motion_params.get('attenuate', True)
+        
+        # Initialize EVM directly
+        self.evm_processor = ColorMagnification()
+        if color_params:
+            self.evm_processor.alpha = color_params.get('alpha', 50)
+            self.evm_processor.level = color_params.get('level', 3)
+            self.evm_processor.f_lo = color_params.get('f_lo', 0.83)
+            self.evm_processor.f_hi = color_params.get('f_hi', 1.0)
+    
+    def process_video(self, input_path: str, output_path: str) -> None:
+        """
+        Process a video to detect deception using ONLY PBM and EVM.
+        
+        This overrides the parent implementation to ensure only PBM and EVM are used.
+        
+        Args:
+            input_path: Path to the input video
+            output_path: Path to save the output video
+        """
+        print(f"\n\n===== Processing {os.path.basename(input_path)} with PBM/EVM ONLY =====")
+        start_time = time.time()
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Open video file
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open video file {input_path}")
+            return
+        
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        self.fps = fps
+        self.total_frames = total_frames
+        self.video_dimensions = (width, height)
+        
+        print(f"Video properties: {width}x{height}, {fps} fps, {total_frames} frames")
+        
+        # Read all frames
+        print("Reading frames...")
+        all_frames = []
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            all_frames.append(frame)
+            frame_count += 1
+            
+            if frame_count % 30 == 0:
+                print(f"Read {frame_count}/{total_frames} frames")
+        
+        # Close input video
+        cap.release()
+        
+        # Initialize result arrays
+        magnified_motion_frames = []
+        magnified_color_frames = []
+        phase_changes = {}
+        heart_rate_data = None
+        
+        # Process each key facial region with PBM (for motion)
+        print("Step 1: Applying PBM for micro-expression detection...")
+        
+        # First detect faces in the initial frame
+        face_detector = self.pbm_processor.face_detector
+        face_results = face_detector.detect_faces(all_frames[0])
+        
+        # Track key regions for motion magnification
+        motion_regions = ['left_eye', 'right_eye', 'nose_tip']
+        
+        # Combined phase changes array for overall micro-expression analysis
+        combined_phase_changes = None
+        valid_regions_count = 0
+        
+        # Only process if we have detected regions
+        if face_results and len(face_results) > 0 and 'regions' in face_results[0]:
+            face_data = face_results[0]
+            
+            # Process each key region separately for motion magnification using PBM
+            for region_name in motion_regions:
+                if region_name in face_data['regions']:
+                    # Standardize region key for storage
+                    region_key = f"face1_{region_name}"
+                    print(f"Processing {region_key} with PBM magnification...")
+                    
+                    # Collect region frames
+                    region_frames = []
+                    valid_frames = []
+                    
+                    for frame_idx, frame in enumerate(all_frames):
+                        # Detect regions for this frame
+                        current_face_results = face_detector.detect_faces(frame)
+                        if current_face_results and 'regions' in current_face_results[0]:
+                            current_face_data = current_face_results[0]
+                            # If region exists in this frame
+                            if region_name in current_face_data['regions']:
+                                region_frames.append(current_face_data['regions'][region_name]['image'])
+                                valid_frames.append(frame_idx)
+                    
+                    if len(region_frames) > 0:
+                        print(f"Collected {len(region_frames)} frames for {region_key}")
+                        
+                        # EXPLICITLY apply PBM magnification to get phase changes
+                        magnified_frames, phase_changes_data = self.pbm_processor.phase_magnifier.magnify(region_frames)
+                        
+                        # Store phase changes for this region
+                        phase_changes[region_key] = phase_changes_data
+                        print(f"Extracted phase changes for {region_key}: {len(phase_changes_data)} values")
+                        
+                        # Add to combined phase changes
+                        if combined_phase_changes is None:
+                            combined_phase_changes = np.zeros(total_frames)
+                        
+                        # Ensure the phase data covers the full video length
+                        padded_phase_data = np.zeros(total_frames)
+                        for i, frame_idx in enumerate(valid_frames):
+                            if i < len(phase_changes_data) and frame_idx < total_frames:
+                                padded_phase_data[frame_idx] = phase_changes_data[i]
+                        
+                        # Add to combined data
+                        combined_phase_changes += padded_phase_data
+                        valid_regions_count += 1
+                        
+                        # Replace regions in magnified motion frames
+                        for i, (frame_idx, magnified) in enumerate(zip(valid_frames, magnified_frames)):
+                            if frame_idx < len(all_frames):
+                                # Initialize magnified motion frame if needed
+                                if frame_idx >= len(magnified_motion_frames):
+                                    while len(magnified_motion_frames) <= frame_idx:
+                                        magnified_motion_frames.append(all_frames[len(magnified_motion_frames)].copy())
+                                
+                                # Get current face data for this frame
+                                current_face_results = face_detector.detect_faces(all_frames[frame_idx])
+                                if current_face_results and 'regions' in current_face_results[0]:
+                                    current_face_data = current_face_results[0]
+                                    # If region exists in this frame
+                                    if region_name in current_face_data['regions']:
+                                        # Get bounds
+                                        bounds = current_face_data['regions'][region_name]['bounds']
+                                        # Replace region
+                                        magnified_motion_frames[frame_idx][bounds[1]:bounds[3], 
+                                                                         bounds[0]:bounds[2]] = magnified
+            
+            # Average the combined phase changes
+            if combined_phase_changes is not None and valid_regions_count > 0:
+                combined_phase_changes /= valid_regions_count
+                # Store the combined data
+                phase_changes['combined'] = combined_phase_changes
+        
+        # Fill in any missing frames for motion
+        while len(magnified_motion_frames) < len(all_frames):
+            magnified_motion_frames.append(all_frames[len(magnified_motion_frames)].copy())
+        
+        # Step 2: Process with EVM (for heart rate)
+        print("Step 2: Applying EVM for heart rate detection...")
+        
+        # Apply EVM directly to the frames - use the correct method name 'magnify'
+        magnified_color_frames = self.evm_processor.magnify(all_frames)
+        
+        # Calculate heart rate using EVM
+        try:
+            from Separate_Color_Motion_Magnification.cheek_detector import CheekDetector
+            cheek_detector = CheekDetector()
+            detected, cheek_regions = cheek_detector.detect_cheeks(all_frames[0])
+            
+            if detected and cheek_regions:
+                # Extract cheek regions from all frames
+                left_cheek_frames = []
+                right_cheek_frames = []
+                
+                for frame in all_frames:
+                    detected, regions = cheek_detector.detect_cheeks(frame)
+                    if detected and regions:
+                        if 'left_cheek' in regions[0]['regions']:
+                            left_cheek_frames.append(regions[0]['regions']['left_cheek']['image'])
+                        if 'right_cheek' in regions[0]['regions']:
+                            right_cheek_frames.append(regions[0]['regions']['right_cheek']['image'])
+                
+                # Calculate color changes for each cheek using EVM
+                color_signals = {}
+                if left_cheek_frames:
+                    # Apply EVM magnification to cheek region
+                    left_magnified = self.evm_processor.magnify(left_cheek_frames)
+                    # Extract color signal using the original processor method
+                    color_signals['left_cheek'] = self.processor.calculate_color_changes(left_magnified)
+                if right_cheek_frames:
+                    # Apply EVM magnification to cheek region
+                    right_magnified = self.evm_processor.magnify(right_cheek_frames)
+                    # Extract color signal using the original processor method
+                    color_signals['right_cheek'] = self.processor.calculate_color_changes(right_magnified)
+                
+                # Calculate heart rate data
+                if color_signals:
+                    # Use the original processor's BPM calculation method which is already optimized
+                    heart_rate_data = self.processor.calculate_bpm(color_signals, fps=fps)
+                    print(f"Extracted heart rate data with {len(heart_rate_data[1])} points")
+        except Exception as e:
+            print(f"Warning: Failed to extract heart rate data: {str(e)}")
+            heart_rate_data = None
+        
+        # Fill in any missing frames for color
+        while len(magnified_color_frames) < len(all_frames):
+            magnified_color_frames.append(all_frames[len(magnified_color_frames)].copy())
+        
+        # Step 3: Fit the deception detector using PBM and EVM data
+        print("Step 3: Fitting deception detection model with PBM/EVM data...")
+        # Use ONLY phase changes for feature extraction, no other motion features
+        self.detector.fit(phase_changes, heart_rate_data, fps, total_frames)
+        
+        # Now use the parent's create output video method
+        # For steps 4+ we can use the parent's method which already has the visualization code
+        print("Step 4: Creating annotated output video...")
+        
+        # Create video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        # Calculate dimensions for the output video with better proportions
+        # Make sure all dimensions are even numbers (required by video codecs)
+        output_width = width * 3  # Three videos side by side
+        # Ensure output_width is even
+        output_width = output_width if output_width % 2 == 0 else output_width - 1
+        
+        # Calculate plot dimensions using 16:9 aspect ratio
+        plot_width = output_width // 2  # Two plots side by side
+        plot_height = (plot_width * 9) // 16  # 16:9 aspect ratio
+        
+        # Ensure plot_height is even
+        plot_height = plot_height if plot_height % 2 == 0 else plot_height - 1
+        
+        # Calculate info panel height (70% of plot height)
+        info_height = (plot_height * 7) // 10
+        info_height = info_height if info_height % 2 == 0 else info_height - 1
+        
+        # Calculate total output height
+        output_height = height + plot_height + info_height
+        # Ensure output_height is even
+        output_height = output_height if output_height % 2 == 0 else output_height - 1
+        
+        print(f"Output video dimensions: {output_width}x{output_height}")
+        out = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
+        
+        # Process each frame to create final output
+        for frame_idx in range(len(all_frames)):
+            if frame_idx % 30 == 0:
+                print(f"Processing output frame {frame_idx}/{total_frames}")
+            
+            # Get frames
+            original_frame = all_frames[frame_idx]
+            motion_frame = magnified_motion_frames[frame_idx]
+            color_frame = magnified_color_frames[frame_idx]
+            
+            # Use combined phase data for visualization
+            combined_phase_data = phase_changes.get('combined', None)
+            
+            if combined_phase_data is not None and len(combined_phase_data) > frame_idx:
+                phase_data = combined_phase_data
+                phase_title = "PBM: Micro-Expression Detection"
+            else:
+                # Create empty phase data if none available
+                phase_data = np.zeros(total_frames)
+                phase_title = "No Micro-Expression Data"
+            
+            # Create phase plot using the dimensions calculated earlier
+            phase_plot = self.processor.create_single_plot(
+                phase_data, frame_idx, plot_width, plot_height,
+                plot_type="diff", title=phase_title, total_frames=total_frames
+            )
+            
+            # Highlight deception regions on the phase plot
+            phase_plot = self.detector.highlight_deception_regions(phase_plot, frame_idx)
+            
+            # Create heart rate plot
+            if heart_rate_data is not None:
+                heart_plot = self.processor.create_heart_rate_plot(
+                    heart_rate_data, frame_idx, plot_width, plot_height
+                )
+            else:
+                # Create empty heart rate plot if data is not available
+                heart_plot = np.ones((plot_height, plot_width, 3), dtype=np.uint8) * 255
+                cv2.putText(heart_plot, "No Heart Rate Data Available", 
+                          (plot_width//10, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            # Highlight deception regions on the heart rate plot
+            heart_plot = self.detector.highlight_deception_regions(heart_plot, frame_idx)
+            
+            # Create deception info panel
+            info_panel = self.create_deception_info_panel(
+                frame_idx, plot_width*2, info_height
+            )
+            
+            # Stitch everything together with corrected proportions
+            output_frame = self.stitch_frames_with_plots(
+                original_frame, motion_frame, color_frame,
+                phase_plot, heart_plot, info_panel
+            )
+            
+            # Write frame to output
+            out.write(output_frame)
+        
+        # Release output video
+        out.release()
+        
+        # Print completion message
+        elapsed_time = time.time() - start_time
+        print(f"Processed {os.path.basename(input_path)} with PBM/EVM in {elapsed_time:.1f} seconds")
+        print(f"Output saved to {output_path}")
+        print(f"===== Completed processing with PBM/EVM ONLY =====\n\n") 
