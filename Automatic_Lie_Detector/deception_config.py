@@ -59,7 +59,7 @@ EVM_PARAMS = {
 # Feature weights for detection (PBM/EVM exclusive)
 FEATURE_WEIGHTS = {
     'phase_change': 3.0,      # Strong weight for PBM micro-expression features
-    'heart_rate': 0.3,        # Heart rate weight now 1/10th of phase change weight
+    'heart_rate': 1.0,        # Heart rate weight now 1/10th of phase change weight
     'cross_correlation': 0.0  # No weight for correlation - not using any other technique
 }
 
