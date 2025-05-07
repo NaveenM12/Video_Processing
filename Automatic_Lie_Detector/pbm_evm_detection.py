@@ -160,6 +160,20 @@ class PBMEVMDetector(AutomaticLieDetector):
         print(f"\n\n===== Processing {os.path.basename(input_path)} with PBM/EVM ONLY =====")
         start_time = time.time()
         
+        # Make EVM parameters available to SideBySideMagnification via global variables
+        # This allows the calculate_color_changes method to use them without parameter changes
+        import builtins
+        builtins.EVM_LOW_FREQ = self.evm_processor.f_lo  # Low frequency for bandpass filter
+        builtins.EVM_HIGH_FREQ = self.evm_processor.f_hi  # High frequency for bandpass filter
+        builtins.EVM_ALPHA = self.evm_processor.alpha  # Amplification factor
+        builtins.EVM_LEVEL = self.evm_processor.level  # Pyramid level
+        if hasattr(self.evm_processor, 'chromAttenuation'):
+            builtins.EVM_CHROM_ATTENUATION = self.evm_processor.chromAttenuation
+        else:
+            builtins.EVM_CHROM_ATTENUATION = 0.0
+            
+        print(f"Set EVM parameters globally: f_lo={builtins.EVM_LOW_FREQ:.4f}, f_hi={builtins.EVM_HIGH_FREQ:.4f}, alpha={builtins.EVM_ALPHA}")
+        
         # Create output directory if it doesn't exist
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
@@ -350,11 +364,14 @@ class PBMEVMDetector(AutomaticLieDetector):
         # Calculate heart rate using EVM
         try:
             # Calculate color changes for each cheek using EVM
+            # Note: This is the ONLY source for heart rate/BPM calculation in the system
+            # The entire heart rate detection is based on Eulerian Video Magnification (EVM)
             color_signals = {}
             
             # Process left cheek
             valid_left_frames = [f for f in left_cheek_frames if f is not None]
             if valid_left_frames:
+                # Use simple calculate_color_changes without parameters
                 color_signals['left_cheek'] = self.processor.calculate_color_changes(valid_left_frames)
             
             # Process right cheek
@@ -367,9 +384,18 @@ class PBMEVMDetector(AutomaticLieDetector):
             # which doesn't accept this parameter
             if color_signals:
                 heart_rate_bin_size = self.params['heart_rate_bin_size']
-                print(f"Using heart rate bin size of {heart_rate_bin_size} frames for BPM calculation")
                 
-                # Get regular heart rate data first
+                # Log EVM parameters being used for heart rate calculation
+                print("----- EVM Parameters for Heart Rate Detection -----")
+                print(f"Alpha (magnification): {self.evm_processor.alpha:.1f}")
+                print(f"Level (pyramid level): {self.evm_processor.level}")
+                print(f"Frequency range: {self.evm_processor.f_lo*60:.1f}-{self.evm_processor.f_hi*60:.1f} BPM")
+                print(f"ChromAttenuation: {getattr(self.evm_processor, 'chromAttenuation', 0.0):.2f}")
+                print(f"Heart rate bin size: {heart_rate_bin_size} frames")
+                print("---------------------------------------------------")
+                
+                # Get regular heart rate data first 
+                print("Calculating heart rate from EVM color signals...")
                 heart_rate_data = self.processor.calculate_bpm(color_signals, fps=fps)
                 
                 if heart_rate_data is not None:
@@ -394,6 +420,13 @@ class PBMEVMDetector(AutomaticLieDetector):
                                 bin_avg = np.mean(valid_values)
                                 # Apply the same average to all frames in this bin
                                 flattened_bpm[bin_start:bin_end] = bin_avg
+                    
+                    # Print statistics about the flattened heart rate
+                    valid_avg = avg_bpm[avg_bpm > 0]
+                    valid_flattened = flattened_bpm[flattened_bpm > 0]
+                    if len(valid_avg) > 0 and len(valid_flattened) > 0:
+                        print(f"Original BPM range: {np.min(valid_avg):.2f} - {np.max(valid_avg):.2f} BPM")
+                        print(f"Flattened BPM range: {np.min(valid_flattened):.2f} - {np.max(valid_flattened):.2f} BPM")
                     
                     # Replace the original avg_bpm with our flattened version
                     # and create a new heart_rate_data tuple
