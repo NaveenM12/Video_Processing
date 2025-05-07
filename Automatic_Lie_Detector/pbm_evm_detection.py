@@ -17,6 +17,7 @@ import numpy as np
 import time
 import argparse
 from typing import Dict, List, Tuple
+from scipy import signal
 
 # Add parent directory to path for imports when run directly
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -114,8 +115,16 @@ class PBMEVMDetector(AutomaticLieDetector):
         # Store the heart rate bin size parameter for use in BPM calculations
         self.params = get_config()
         
+        # Store fps and video dimensions (will be set during processing)
+        self.fps = 30
+        self.total_frames = 0
+        self.video_dimensions = (0, 0)
+        
         # Override detector with specialized detection parameters
         self.detector = DeceptionDetector(DETECTION_PARAMS)
+        
+        # Initialize CheekDetector for heart rate detection
+        self.cheek_detector = CheekDetector()
         
         # Override the processor with direct implementations
         # Initialize PBM directly for micro-expression detection
@@ -418,17 +427,14 @@ class PBMEVMDetector(AutomaticLieDetector):
             # Process left cheek
             valid_left_frames = [f for f in left_cheek_frames if f is not None]
             if valid_left_frames:
-                # Use simple calculate_color_changes without parameters
-                color_signals['left_cheek'] = self.processor.calculate_color_changes(valid_left_frames)
+                color_signals['left_cheek'] = self.calculate_color_changes(valid_left_frames)
             
             # Process right cheek
             valid_right_frames = [f for f in right_cheek_frames if f is not None]
             if valid_right_frames:
-                color_signals['right_cheek'] = self.processor.calculate_color_changes(valid_right_frames)
+                color_signals['right_cheek'] = self.calculate_color_changes(valid_right_frames)
             
-            # Calculate heart rate data - but don't pass the heart_rate_bin_size parameter yet
-            # The original error shows we're actually using SideBySideMagnification's method
-            # which doesn't accept this parameter
+            # Calculate heart rate data
             if color_signals:
                 heart_rate_bin_size = self.params['heart_rate_bin_size']
                 
@@ -441,9 +447,9 @@ class PBMEVMDetector(AutomaticLieDetector):
                 print(f"Heart rate bin size: {heart_rate_bin_size} frames")
                 print("---------------------------------------------------")
                 
-                # Get regular heart rate data first 
+                # Calculate heart rate data using our EVM-based method
                 print("Calculating heart rate from EVM color signals...")
-                heart_rate_data = self.processor.calculate_bpm(color_signals, fps=fps)
+                heart_rate_data = self.calculate_bpm(color_signals, fps=fps)
                 
                 if heart_rate_data is not None:
                     # Now manually apply the binning to the avg_bpm data
@@ -615,6 +621,243 @@ class PBMEVMDetector(AutomaticLieDetector):
         print(f"Output saved to {output_path}")
         print(f"===== Completed processing with PBM/EVM ONLY =====\n\n")
 
+    def calculate_color_changes(self, frames):
+        """Calculate color changes across frames specifically using Eulerian Video Magnification
+        
+        This method extracts color change intensity directly using EVM magnification process
+        rather than using any green channel analysis or other approaches. This ensures the
+        color change intensity and heartrate calculations are purely based on EVM.
+        
+        Args:
+            frames: List of region frames
+            
+        Returns:
+            Array of color changes across frames from EVM processing
+        """
+        try:
+            if not frames or len(frames) < 2:
+                return np.zeros(len(frames) if frames else 0)
+                
+            # Get parameters from our initialized EVM processor
+            print(f"Using EVM parameters: f_lo={self.evm_processor.f_lo:.4f}, f_hi={self.evm_processor.f_hi:.4f}, alpha={self.evm_processor.alpha}, level={self.evm_processor.level}")
+            
+            # Convert all frames to YIQ color space (used by EVM)
+            yiq_frames = np.array([self.evm_processor.bgr2yiq(frame) for frame in frames])
+            
+            # Get dimensions for the pyramid
+            height, width = frames[0].shape[:2]
+            pyr_height = height
+            pyr_width = width
+            for _ in range(self.evm_processor.level):
+                pyr_height = (pyr_height + 1) // 2
+                pyr_width = (pyr_width + 1) // 2
+            
+            # Focus on Y channel (luminance) - same as in the EVM magnify method
+            channel = 0  # Y channel in YIQ
+            channel_frames = yiq_frames[:, :, :, channel]
+            
+            # Build pyramid for each frame using EVM's own method
+            pyramid_frames = np.zeros((len(frames), pyr_height, pyr_width))
+            
+            for i, frame in enumerate(channel_frames):
+                # Create 2D frame
+                frame_2d = frame.reshape(height, width)
+                pyramid = self.evm_processor.build_gaussian_pyramid(frame_2d)
+                # Get the last level (most downsampled)
+                pyramid_frames[i] = cv2.resize(pyramid[-1], (pyr_width, pyr_height))
+            
+            # Apply temporal filter to pyramid level using EVM's own method
+            filtered = self.evm_processor.temporal_bandpass_filter(pyramid_frames)
+            
+            # To obtain a 1D signal, compute the mean of the filtered signal at each frame
+            # This represents the overall color change intensity from the EVM process
+            signal_data = np.array([np.mean(filtered[i]) for i in range(len(frames))])
+            
+            # Normalize signal
+            signal_data = signal_data - np.mean(signal_data)
+            if np.std(signal_data) > 0:
+                signal_data = signal_data / np.std(signal_data)
+            
+            return signal_data
+            
+        except Exception as e:
+            print(f"Error in calculate_color_changes: {str(e)}")
+            # Return zeros with the same length as input
+            return np.zeros(len(frames) if frames else 0)
+
+    def calculate_bpm(self, color_signals, fps=30):
+        """Calculate heart rate (BPM) from color signals using EVM-based approach
+        
+        Extracts heart rate (beats per minute) from the color signals generated
+        by the EVM process. This ensures the heart rate calculation is purely based
+        on the Eulerian Video Magnification approach.
+        
+        Args:
+            color_signals: Dictionary of color signals from different regions
+            fps: Frames per second of the video
+            
+        Returns:
+            Tuple of:
+                - Array of instantaneous BPM values per frame
+                - Array of average BPM values per window (smoother)
+                - Array of combined color signal
+        """
+        try:
+            if not color_signals:
+                print("No color signals provided to calculate BPM")
+                return None
+                
+            # Find the first non-empty signal to get the length
+            signal_length = 0
+            for signal_data in color_signals.values():
+                if len(signal_data) > 0:
+                    signal_length = len(signal_data)
+                    break
+                    
+            if signal_length == 0:
+                print("All color signals are empty")
+                return None
+            
+            # Combine signals from all regions (typically left and right cheeks)
+            combined_signal = np.zeros(signal_length)
+            count = 0
+            
+            for signal_data in color_signals.values():
+                if len(signal_data) == signal_length:
+                    combined_signal += signal_data
+                    count += 1
+                    
+            if count == 0:
+                print("No valid color signals to combine")
+                return None
+                
+            # Normalize combined signal
+            combined_signal = combined_signal - np.mean(combined_signal)
+            if np.std(combined_signal) > 0:
+                combined_signal = combined_signal / np.std(combined_signal)
+            
+            # Get heart rate range directly from EVM parameters (Hz to BPM)
+            f_lo_bpm = self.evm_processor.f_lo * 60
+            f_hi_bpm = self.evm_processor.f_hi * 60
+            print(f"Using EVM heart rate frequency range: {f_lo_bpm:.1f}-{f_hi_bpm:.1f} BPM")
+            
+            # Initialize BPM arrays
+            inst_bpm = np.zeros(signal_length)
+            
+            # Detect peaks in the signal using consistent parameters with EVM
+            # Minimum distance based on lowest expected heart rate frequency
+            min_heart_rate_hz = self.evm_processor.f_lo
+            peak_distance = int(fps / min_heart_rate_hz / 2)  # Frames between peaks
+            
+            # Keep within reasonable bounds
+            peak_distance = max(3, min(peak_distance, signal_length // 4))
+            print(f"Peak detection distance: {peak_distance} frames (based on EVM f_lo={self.evm_processor.f_lo:.4f}Hz)")
+            
+            # Find peaks in the combined signal
+            peaks, _ = signal.find_peaks(combined_signal, distance=peak_distance)
+            
+            # If we have enough peaks, calculate BPM from peak intervals
+            if len(peaks) >= 2:
+                print(f"Found {len(peaks)} peaks in the heart rate signal")
+                
+                # Calculate instantaneous heart rate between consecutive peaks
+                for i in range(len(peaks) - 1):
+                    # Time between peaks in seconds
+                    time_between_peaks = (peaks[i+1] - peaks[i]) / fps
+                    
+                    # Convert to BPM
+                    if time_between_peaks > 0:
+                        curr_bpm = 60 / time_between_peaks
+                        
+                        # Only use values within EVM frequency range
+                        if f_lo_bpm <= curr_bpm <= f_hi_bpm:
+                            # Apply to frames between these peaks
+                            start_idx = peaks[i]
+                            end_idx = peaks[i+1]
+                            inst_bpm[start_idx:end_idx] = curr_bpm
+                
+                # Fill in any remaining frames at the end
+                if peaks[-1] < signal_length and len(peaks) >= 2:
+                    # Use last valid interval
+                    last_interval = (peaks[-1] - peaks[-2]) / fps
+                    if last_interval > 0:
+                        last_bpm = 60 / last_interval
+                        if f_lo_bpm <= last_bpm <= f_hi_bpm:
+                            inst_bpm[peaks[-1]:] = last_bpm
+            else:
+                # Not enough peaks - use frequency domain analysis (consistent with EVM)
+                print(f"Not enough peaks detected ({len(peaks)}). Using frequency domain analysis.")
+                
+                # Perform FFT - consistent with frequency-domain approach of EVM
+                fft_values = np.abs(np.fft.rfft(combined_signal))
+                frequencies = np.fft.rfftfreq(len(combined_signal), d=1.0/fps)
+                
+                # Limit to EVM frequency range
+                valid_range = (frequencies >= self.evm_processor.f_lo) & (frequencies <= self.evm_processor.f_hi)
+                if np.any(valid_range):
+                    valid_freqs = frequencies[valid_range]
+                    valid_fft = fft_values[valid_range]
+                    
+                    if len(valid_fft) > 0:
+                        # Find dominant frequency in the EVM band
+                        peak_idx = np.argmax(valid_fft)
+                        peak_freq = valid_freqs[peak_idx]
+                        
+                        # Convert to BPM
+                        default_bpm = peak_freq * 60
+                        print(f"Dominant frequency: {peak_freq:.4f}Hz ({default_bpm:.1f} BPM)")
+                        
+                        # Apply to all frames
+                        inst_bpm[:] = default_bpm
+                    else:
+                        # Use middle of the EVM range if no clear peak
+                        default_bpm = (f_lo_bpm + f_hi_bpm) / 2
+                        inst_bpm[:] = default_bpm
+                else:
+                    # Use middle of the EVM range if no valid frequencies
+                    default_bpm = (f_lo_bpm + f_hi_bpm) / 2
+                    inst_bpm[:] = default_bpm
+            
+            # Calculate average BPM with sliding window
+            # Window size based on EVM parameters for consistency
+            avg_bpm = np.zeros_like(inst_bpm)
+            window_len = int(fps * 3 / self.evm_processor.f_lo)  # 3 cycles of lowest frequency
+            window_len = min(window_len, signal_length // 2)
+            window_len = max(window_len, int(fps * 2))  # At least 2 seconds
+            
+            print(f"Using heart rate averaging window of {window_len} frames ({window_len/fps:.1f} seconds)")
+            
+            # Apply sliding window average
+            for i in range(signal_length):
+                start_idx = max(0, i - window_len//2)
+                end_idx = min(signal_length, i + window_len//2)
+                values = inst_bpm[start_idx:end_idx]
+                values = values[values > 0]  # Only use non-zero values
+                if len(values) > 0:
+                    avg_bpm[i] = np.mean(values)
+                else:
+                    # Use midpoint of valid range if no values
+                    avg_bpm[i] = (f_lo_bpm + f_hi_bpm) / 2
+            
+            # Apply final smoothing for display
+            if signal_length > 5:
+                # Determine window size (must be odd)
+                sg_window = min(21, signal_length // 2)
+                if sg_window % 2 == 0:
+                    sg_window += 1
+                
+                if sg_window >= 5:  # Need at least 5 points for quadratic fit
+                    avg_bpm = signal.savgol_filter(avg_bpm, sg_window, 2)
+            
+            print(f"Heart rate analysis complete. BPM range: {np.min(avg_bpm[avg_bpm > 0]):.1f}-{np.max(avg_bpm):.1f}")
+            return inst_bpm, avg_bpm, combined_signal
+            
+        except Exception as e:
+            print(f"Error in calculate_bpm: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="""
@@ -652,10 +895,16 @@ def run_detector():
     """
     args = parse_arguments()
     
-    print("===== Starting PBM/EVM-EXCLUSIVE Deception Detector =====")
-    print(f"Current directory: {os.getcwd()}")
-    print("Using ONLY Phase-Based Magnification (PBM) for micro-expression detection")
-    print("Using ONLY Eulerian Video Magnification (EVM) for heart rate analysis")
+    print("\n" + "="*80)
+    print(" PBM/EVM-EXCLUSIVE Deception Detector ".center(80, "="))
+    print("="*80)
+    print("This detector EXCLUSIVELY utilizes:")
+    print("1. Phase-Based Magnification (PBM) for micro-expression detection")
+    print("2. Eulerian Video Magnification (EVM) for heart rate analysis")
+    print("No other motion detection or physiological measurement techniques are used.")
+    print("="*80 + "\n")
+    
+    print(f"Current working directory: {os.getcwd()}")
     
     # Create our specialized detector instance that uses only PBM and EVM
     detector = PBMEVMDetector(
@@ -685,7 +934,9 @@ def run_detector():
         
         detector.process_folder(args.input, args.output)
     
-    print("===== PBM/EVM-EXCLUSIVE Deception Detector Complete =====")
+    print("\n" + "="*80)
+    print(" PBM/EVM-EXCLUSIVE Deception Detector Complete ".center(80, "="))
+    print("="*80 + "\n")
 
 if __name__ == "__main__":
     run_detector() 
