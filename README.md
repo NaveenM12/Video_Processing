@@ -2,6 +2,11 @@
 
 This repository contains various implementations of deception detection approaches using facial micro-expressions and physiological signals.
 
+
+CIS 4980 - SENIOR THESIS - NAVEEN MIRAPURI
+SEE FULL PAPER HERE: https://docs.google.com/document/d/10ZHX9YoqdBPSwx63Rndku3zwC49oYc_GGo8EmWTmyio/edit?usp=sharing
+
+
 ## Directory Structure
 
 - **`/Automatic_Lie_Detector`** - Contains the main deception detection implementations
