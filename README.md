@@ -1,11 +1,8 @@
 # VideoProcessing
 
-This repository contains various implementations of deception detection approaches using facial micro-expressions and physiological signals.
+### [Modernizing the Polygraph: Combining Computer-Vision Magnification Techniques to Detect Lies by Naveen Mirapuri](https://docs.google.com/document/d/10ZHX9YoqdBPSwx63Rndku3zwC49oYc_GGo8EmWTmyio/edit?usp=sharing) 
 
-
-CIS 4980 - SENIOR THESIS - NAVEEN MIRAPURI
-SEE FULL PAPER HERE: https://docs.google.com/document/d/10ZHX9YoqdBPSwx63Rndku3zwC49oYc_GGo8EmWTmyio/edit?usp=sharing
-
+Please read the paper above for detailed explanation of approach and implementation for this project. This repository contains various implementations of deception detection approaches using facial micro-expressions and physiological signals.
 
 ## Directory Structure
 
